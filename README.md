@@ -1,68 +1,122 @@
 # Jon_Thesis — MFC Control System (Arduino Giga)
 
 Arduino-based dosing control for a microbial fuel cell (MFC) system using three inputs:
-- Diluted synthetic winery wastewater (“wine”)
-- Diluted fully fermented urine
-- Diluted dried Spirulina
 
-The controller prioritizes maintaining safe chemical operating ranges using measured state variables:
-- pH
-- EC (mS/cm)
-- TAN (Total Ammonia Nitrogen, mg-N/L)
+- Diluted synthetic winery wastewater ("wine") — 100:1 dilution, pH 4.0
+- Diluted fully fermented urine — 4:1 dilution, pH 8.5, EC 6.25 mS/cm
+- Spirulina solution — 15 g/L, pH 9.0, EC 1.14 mS/cm
 
-Outputs (monitored separately / not directly controlled here):
+## State Space Formulation
+
+The system is modeled as:
+
+```
+ẋ = Ax + Bu + d
+```
+
+Where:
+- **x** = [pH, EC, TAN]ᵀ — state vector
+- **u** = [Q_wine, Q_urine, Q_spirulina]ᵀ — input vector (flow rates, mL/min)
+- **A** — autonomous dynamics matrix (biological decay)
+- **B** — input coupling matrix (mixing physics)
+- **d** — constant drift vector (zero-order consumption)
+
+### State Variables
+
+| State | Description | Target Range | Units |
+|-------|-------------|--------------|-------|
+| pH | Hydrogen ion activity | 6.8 – 7.2 | — |
+| EC | Electrical conductivity | 5.0 – 10.0 | mS/cm |
+| TAN | Total ammonia nitrogen | 50 – 200 | mg-N/L |
+
+### Autonomous Dynamics (A matrix + drift d)
+
+Without inputs, the system evolves according to ODEs:
+
+```
+d(pH)/dt  = -0.0005 /min      (CO₂/VFA production)
+d(EC)/dt  = -0.001 mS/cm/min  (ion uptake by bacteria)
+d(TAN)/dt = -0.3 mg-N/L/min   (bacterial assimilation)
+```
+
+These rates are approximately constant within the operating range (Batstone et al., *Water Sci. Tech.* 2002).
+
+### Input Coupling (B matrix)
+
+Dosing follows CSTR mixing physics:
+
+```
+x_new = (x_reactor × V_reactor + x_input × V_dose) / (V_reactor + V_dose)
+```
+
+| Input | pH | EC (mS/cm) | TAN (mg-N/L) | Effect |
+|-------|-----|------------|--------------|--------|
+| Wine | 4.0 | 0.02 | 0.1 | ↓ pH, ↓ EC, ↓ TAN |
+| Urine | 8.5 | 6.25 | 200 | ↑ pH, ↑ EC, ↑ TAN |
+| Spirulina | 9.0 | 1.14 | 144 | ↑ pH, ↓ EC*, ↑ TAN |
+
+*Spirulina EC (1.14) is lower than reactor target (5.0), so it dilutes EC.
+
+## Control Logic
+
+**Priority:** pH > TAN > EC > Metals
+
+Every control cycle (1–5 minutes):
+1. Read sensors (pH, EC, TAN)
+2. Apply control decision based on priority
+3. Dose one input if needed
+
+### Dosing Actions
+
+| Condition | Action | Reason |
+|-----------|--------|--------|
+| pH > 7.2 | Dose wine | Acid lowers pH |
+| pH < 6.8 | Dose urine | Base raises pH |
+| TAN < 50 AND EC < 5.0 | Dose urine | Provides both |
+| TAN < 50 AND EC ≥ 5.0 | Dose spirulina | TAN without diluting EC |
+| EC < 5.0 | Dose urine | High ionic content |
+| All in range | No action | — |
+
+## Outputs (Monitored, Not Controlled)
+
 - MFC voltage
 - ORP (redox potential)
+- Trace metals (Fe, Zn, Cu, Mn, Se, Ni, Co)
 
-## Control logic (high-level)
-**Priority:** pH > TAN > EC
+## Trace Metals
 
-Every 5 minutes:
-1. Read sensors (pH, EC, TAN)
-2. Print status + flags (LOW/HIGH/OK)
-3. Dose one input based on priority and error magnitude
+Spirulina (15 g/L) provides:
 
-### Dosing actions
-- **pH high:** dose winery wastewater (acidify / dilute)
-- **pH low:** dose urine (alkalinize)
-- **TAN low:** dose Spirulina (nitrogen source)
-- **TAN high:** dose winery wastewater (dilution)
-- **EC low:** dose urine (ionic strength)
-- **EC high:** dose winery wastewater (dilution)
+| Metal | Concentration | Target | Status |
+|-------|---------------|--------|--------|
+| Fe | 4.28 mg/L | 1.0–10.0 | ✓ OK |
+| Zn | 0.30 mg/L | 0.1–1.0 | ✓ OK |
+| Cu | 0.92 mg/L | 0.01–0.5 | ⚠ High |
+| Mn | 0.29 mg/L | 0.1–1.0 | ✓ OK |
+| Ni | 0 mg/L | 0.05–1.0 | ✗ None |
+| Co | 0 mg/L | 0.01–0.3 | ✗ None |
 
-## Hardware assumptions
-- Arduino Giga
-- Relay-controlled pumps (active HIGH)
-- Analog sensors: pH, EC, TAN (connected to A0/A1/A2)
+Note: Spirulina contains no Ni or Co. These would require supplementation if needed.
 
-## Pin mapping
-| Function | Pin |
-|---|---|
-| Wine pump relay | D0 |
-| Urine pump relay | D1 |
-| Spirulina pump relay | D2 |
-| Status LED | D3 |
-| pH sensor | A0 |
-| EC sensor | A1 |
-| TAN sensor | A2 |
+## Hardware
 
-## Parameters to calibrate
-Before running, update these based on your sensor calibration:
-- `PH_SLOPE`, `PH_OFFSET`
-- `EC_SLOPE`, `EC_OFFSET`
-- `TAN_SLOPE`, `TAN_OFFSET`
+- Arduino Giga R1
+- pH sensor (analog)
+- EC sensor (analog)
+- TAN sensor (ISE or colorimetric)
+- 3× peristaltic pumps (relay-controlled)
 
-Also review:
-- setpoint ranges (`PH_MIN/MAX`, `EC_MIN/MAX`, `TAN_MIN/MAX`)
-- dosing interval (`DOSE_INTERVAL`)
-- pump rate (`PUMP_RATE`)
-- gains (`K_PH`, `K_EC`, `K_TAN`)
+## Files
 
-## Safety notes
-This code is a prototype controller. Add your own safety interlocks as appropriate (max daily dosing limits, tank level sensing, fault handling, watchdog behavior, etc.) before unattended operation.
+- `MFC CONTROL SYSTEM - Arduino Giga/` — Arduino code
+- `mfc_simulation.py` — Python simulation matching state-space formulation
 
-## How to use
-1. Open `arduino/MFC_Control_System/MFC_Control_System.ino` in the Arduino IDE
-2. Select Arduino Giga board + correct COM port
-3. Upload
-4. Monitor via Serial at 115200 baud
+## References
+
+1. Batstone, D.J. et al. (2002). The IWA Anaerobic Digestion Model No 1 (ADM1). *Water Science & Technology*, 45(10):65-73.
+2. Siegrist, H. et al. (2002). Mathematical model for meso- and thermophilic anaerobic sewage sludge digestion. *Water Science & Technology*, 45(10):93-100.
+3. Udert, K.M. et al. (2006). Fate of nitrogen and phosphorus in source-separated urine. *Water Research*, 40(9):1803-1812.
+
+## Author
+
+Jonathan Miller — Boston University
