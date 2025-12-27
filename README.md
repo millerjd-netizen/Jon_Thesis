@@ -104,7 +104,7 @@ Note: Spirulina contains no Ni or Co. These would require supplementation if nee
 - pH sensor (analog)
 - EC sensor (analog)
 - TAN sensor (ISE or colorimetric)
-- 3× peristaltic pumps (relay-controlled)
+- 3× 3v submersible pumps (relay-controlled)
 
 ## Files
 
