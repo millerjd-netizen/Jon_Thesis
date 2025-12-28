@@ -1,0 +1,158 @@
+// ============================================
+// MFC BASELINE - PRIMITIVE CALIBRATION
+// Dose every minute, adjust by 1 second based on response
+// ============================================
+
+#define PUMP_WINE      0
+#define PUMP_URINE     1
+#define PUMP_SPIRULINA 2
+#define PH_SENSOR      A0
+#define EC_SENSOR      A1
+#define NH4_SENSOR     A2
+
+// Sensor calibration
+const float PH_SLOPE  = -0.0178;
+const float PH_OFFSET = 21.34;
+const float EC_SLOPE  = 0.0244;
+const float EC_OFFSET = 0.0;
+const float TAN_SLOPE = 0.488;
+const float TAN_OFFSET = 0.0;
+
+// Dose times (start at 1 second)
+int wineDose = 1;
+int urineDose = 1;
+int spirulinaDose = 1;
+
+// Previous readings
+float prevPH = 0;
+float prevEC = 0;
+float prevTAN = 0;
+
+// Current readings
+float pH = 0;
+float EC = 0;
+float TAN = 0;
+
+// Thresholds - change too small, increase dose
+const float PH_MIN_CHANGE = 0.02;
+const float EC_MIN_CHANGE = 0.1;
+const float TAN_MIN_CHANGE = 5.0;
+
+// Thresholds - change too big, decrease dose
+const float PH_MAX_CHANGE = 0.15;
+const float EC_MAX_CHANGE = 0.8;
+const float TAN_MAX_CHANGE = 30.0;
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(PUMP_WINE, OUTPUT);
+  pinMode(PUMP_URINE, OUTPUT);
+  pinMode(PUMP_SPIRULINA, OUTPUT);
+  
+  digitalWrite(PUMP_WINE, LOW);
+  digitalWrite(PUMP_URINE, LOW);
+  digitalWrite(PUMP_SPIRULINA, LOW);
+  
+  Serial.println("=== MFC BASELINE CALIBRATION ===");
+  Serial.println("Dosing all 3 pumps every minute");
+  Serial.println("Adjusting dose times based on sensor response");
+  Serial.println();
+  
+  readSensors();
+  prevPH = pH;
+  prevEC = EC;
+  prevTAN = TAN;
+}
+
+void loop() {
+  // Store previous
+  prevPH = pH;
+  prevEC = EC;
+  prevTAN = TAN;
+  
+  // Dose all three
+  Serial.println("--- DOSING ---");
+  
+  Serial.print("WINE: "); Serial.print(wineDose); Serial.println("s");
+  digitalWrite(PUMP_WINE, HIGH);
+  delay(wineDose * 1000);
+  digitalWrite(PUMP_WINE, LOW);
+  
+  Serial.print("URINE: "); Serial.print(urineDose); Serial.println("s");
+  digitalWrite(PUMP_URINE, HIGH);
+  delay(urineDose * 1000);
+  digitalWrite(PUMP_URINE, LOW);
+  
+  Serial.print("SPIRULINA: "); Serial.print(spirulinaDose); Serial.println("s");
+  digitalWrite(PUMP_SPIRULINA, HIGH);
+  delay(spirulinaDose * 1000);
+  digitalWrite(PUMP_SPIRULINA, LOW);
+  
+  // Wait remainder of minute
+  int doseTime = (wineDose + urineDose + spirulinaDose) * 1000;
+  int waitTime = 60000 - doseTime;
+  if (waitTime > 0) delay(waitTime);
+  
+  // Read sensors
+  readSensors();
+  
+  // Calculate changes
+  float dPH = abs(pH - prevPH);
+  float dEC = abs(EC - prevEC);
+  float dTAN = abs(TAN - prevTAN);
+  
+  // Print readings
+  Serial.println("--- READINGS ---");
+  Serial.print("pH:  "); Serial.print(pH, 2); Serial.print("  delta: "); Serial.println(dPH, 3);
+  Serial.print("EC:  "); Serial.print(EC, 2); Serial.print("  delta: "); Serial.println(dEC, 3);
+  Serial.print("TAN: "); Serial.print(TAN, 1); Serial.print("  delta: "); Serial.println(dTAN, 2);
+  
+  // Adjust wine based on pH
+  if (dPH < PH_MIN_CHANGE) {
+    wineDose++;
+    Serial.println("pH change too small -> wine +1s");
+  } else if (dPH > PH_MAX_CHANGE) {
+    if (wineDose > 1) wineDose--;
+    Serial.println("pH change too big -> wine -1s");
+  }
+  
+  // Adjust urine based on EC
+  if (dEC < EC_MIN_CHANGE) {
+    urineDose++;
+    Serial.println("EC change too small -> urine +1s");
+  } else if (dEC > EC_MAX_CHANGE) {
+    if (urineDose > 1) urineDose--;
+    Serial.println("EC change too big -> urine -1s");
+  }
+  
+  // Adjust spirulina based on TAN
+  if (dTAN < TAN_MIN_CHANGE) {
+    spirulinaDose++;
+    Serial.println("TAN change too small -> spirulina +1s");
+  } else if (dTAN > TAN_MAX_CHANGE) {
+    if (spirulinaDose > 1) spirulinaDose--;
+    Serial.println("TAN change too big -> spirulina -1s");
+  }
+  
+  Serial.println();
+  Serial.print("Next doses: W="); Serial.print(wineDose);
+  Serial.print("s U="); Serial.print(urineDose);
+  Serial.print("s S="); Serial.print(spirulinaDose); Serial.println("s");
+  Serial.println("================================");
+  Serial.println();
+}
+
+void readSensors() {
+  long phRaw = 0, ecRaw = 0, tanRaw = 0;
+  
+  for (int i = 0; i < 10; i++) {
+    phRaw += analogRead(PH_SENSOR);
+    ecRaw += analogRead(EC_SENSOR);
+    tanRaw += analogRead(NH4_SENSOR);
+    delay(10);
+  }
+  
+  pH = PH_SLOPE * (phRaw / 10) + PH_OFFSET;
+  EC = EC_SLOPE * (ecRaw / 10) + EC_OFFSET;
+  TAN = TAN_SLOPE * (tanRaw / 10) + TAN_OFFSET;
+}
