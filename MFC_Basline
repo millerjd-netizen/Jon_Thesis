@@ -1,75 +1,32 @@
 // ============================================
-// MFC BASELINE - PRIMITIVE CALIBRATION
-// Dose every minute, adjust by 1 second based on response
-// Now with trace metal tracking + calibration
+// MFC PRIMITIVE BASELINE - Arduino Giga
+// Simple bang-bang control with fixed doses
+// No model - just threshold checks
+// 
+// Inputs: Wine, Urine, Spirulina
+// Controls: pH, EC, TAN
+// Tracks: Fe, Zn, Cu, Mn, Se, Ni, Co
+// Priority: pH > TAN > EC
 // ============================================
 
-#define PUMP_WINE      0
-#define PUMP_URINE     1
-#define PUMP_SPIRULINA 2
-#define PH_SENSOR      A0
-#define EC_SENSOR      A1
-#define NH4_SENSOR     A2
+// === PIN DEFINITIONS ===
+#define PUMP_WINE      0   // D0 - Wine pump relay
+#define PUMP_URINE     1   // D1 - Urine pump relay
+#define PUMP_SPIRULINA 2   // D2 - Spirulina pump relay
+#define STATUS_LED     3   // D3 - Status LED
+#define PH_SENSOR      A0  // Analog pH input
+#define EC_SENSOR      A1  // Analog EC input
+#define NH4_SENSOR     A2  // Analog ammonia input
 
-// Sensor calibration
-const float PH_SLOPE  = -0.0178;
-const float PH_OFFSET = 21.34;
-const float EC_SLOPE  = 0.0244;
-const float EC_OFFSET = 0.0;
-const float TAN_SLOPE = 0.488;
-const float TAN_OFFSET = 0.0;
+// === TARGET SETPOINTS ===
+const float PH_MIN        = 6.8;
+const float PH_MAX        = 7.2;
+const float EC_MIN        = 5.0;
+const float EC_MAX        = 10.0;
+const float TAN_MIN       = 50.0;
+const float TAN_MAX       = 200.0;
 
-// Pump flow rate (mL per second)
-const float PUMP_RATE = 1.5;
-
-// Reactor volume (mL) - increases with dosing
-float reactorVolume = 1000.0;
-
-// Dose times (start at 1 second)
-int wineDose = 1;
-int urineDose = 1;
-int spirulinaDose = 1;
-
-// Previous readings
-float prevPH = 0;
-float prevEC = 0;
-float prevTAN = 0;
-
-// Current readings
-float pH = 0;
-float EC = 0;
-float TAN = 0;
-
-// Thresholds - change too small, increase dose
-const float PH_MIN_CHANGE = 0.02;
-const float EC_MIN_CHANGE = 0.1;
-const float TAN_MIN_CHANGE = 5.0;
-
-// Thresholds - change too big, decrease dose
-const float PH_MAX_CHANGE = 0.15;
-const float EC_MAX_CHANGE = 0.8;
-const float TAN_MAX_CHANGE = 30.0;
-
-// === TRACE METAL TRACKING ===
-// Current estimates (mg/L)
-float Fe = 1.0;
-float Zn = 0.1;
-float Cu = 0.05;
-float Mn = 0.1;
-float Se = 0.01;
-float Ni = 0.01;
-float Co = 0.01;
-
-// Previous estimates (mg/L)
-float prevFe = 1.0;
-float prevZn = 0.1;
-float prevCu = 0.05;
-float prevMn = 0.1;
-float prevSe = 0.01;
-float prevNi = 0.01;
-float prevCo = 0.01;
-
-// Metal targets (mg/L)
+// === TRACE METAL TARGETS (mg/L) ===
 const float FE_MIN = 1.0,  FE_MAX = 10.0;
 const float ZN_MIN = 0.1,  ZN_MAX = 1.0;
 const float CU_MIN = 0.01, CU_MAX = 0.5;
@@ -78,333 +35,296 @@ const float SE_MIN = 0.01, SE_MAX = 0.1;
 const float NI_MIN = 0.05, NI_MAX = 1.0;
 const float CO_MIN = 0.01, CO_MAX = 0.3;
 
-// Metal change thresholds - too small, increase dose
-const float FE_MIN_CHANGE = 0.01;
-const float ZN_MIN_CHANGE = 0.001;
-const float CU_MIN_CHANGE = 0.001;
-const float MN_MIN_CHANGE = 0.001;
-const float SE_MIN_CHANGE = 0.0001;
-const float NI_MIN_CHANGE = 0.0001;
-const float CO_MIN_CHANGE = 0.0001;
+// === REACTOR PARAMETERS ===
+float reactorVolume = 1000.0;  // mL (will increase with dosing)
 
-// Metal change thresholds - too big, decrease dose
-const float FE_MAX_CHANGE = 0.1;
-const float ZN_MAX_CHANGE = 0.01;
-const float CU_MAX_CHANGE = 0.01;
-const float MN_MAX_CHANGE = 0.01;
-const float SE_MAX_CHANGE = 0.001;
-const float NI_MAX_CHANGE = 0.001;
-const float CO_MAX_CHANGE = 0.001;
+// === DOSING PARAMETERS ===
+const unsigned long DOSE_INTERVAL = 60000; // 1 min in ms
+const float DOSE_VOLUME   = 5.0;   // mL per dose (fixed)
+const float PUMP_RATE     = 1.5;   // mL per second
+const int DOSE_TIME_SEC   = 3;     // seconds per dose (~5mL)
 
-// Wine metals (mg/L) - 100:1 diluted
-const float WINE_FE = 0.05;
-const float WINE_ZN = 0.01;
-const float WINE_CU = 0.001;
-const float WINE_MN = 0.02;
-const float WINE_SE = 0.0;
-const float WINE_NI = 0.0;
-const float WINE_CO = 0.0;
+// === SENSOR CALIBRATION ===
+const float PH_SLOPE      = -0.0178;
+const float PH_OFFSET     = 21.34;
+const float EC_SLOPE      = 0.0244;
+const float EC_OFFSET     = 0.0;
+const float TAN_SLOPE     = 0.488;
+const float TAN_OFFSET    = 0.0;
 
-// Urine metals (mg/L) - 4:1 diluted
-const float URINE_FE = 0.01;
-const float URINE_ZN = 0.05;
-const float URINE_CU = 0.01;
-const float URINE_MN = 0.005;
-const float URINE_SE = 0.001;
-const float URINE_NI = 0.002;
-const float URINE_CO = 0.001;
+// === DRIFT RATES (no model, just constant drift) ===
+const float D_PH  = -0.0005;   // pH/min
+const float D_EC  = -0.001;    // mS/cm/min
+const float D_TAN = -0.3;      // mg-N/L/min
 
-// Spirulina metals (mg/L) - 15 g/L
-const float SPIR_FE = 4.275;
-const float SPIR_ZN = 0.300;
-const float SPIR_CU = 0.915;
-const float SPIR_MN = 0.285;
-const float SPIR_SE = 0.00105;
-const float SPIR_NI = 0.0;
-const float SPIR_CO = 0.0;
+const float METAL_DECAY_RATE = 0.0005; // per minute
 
-// Metal decay rate (per minute) - PLACEHOLDER, needs literature value
-const float METAL_DECAY = 0.0005;
+// === SUBSTRATE PROPERTIES ===
+// Wine (100:1 diluted)
+const float WINE_PH  = 4.0;
+const float WINE_EC  = 0.02;
+const float WINE_TAN = 0.1;
+const float WINE_FE  = 0.05;
+const float WINE_ZN  = 0.01;
+const float WINE_CU  = 0.001;
+const float WINE_MN  = 0.02;
+const float WINE_SE  = 0.0;
+const float WINE_NI  = 0.0;
+const float WINE_CO  = 0.0;
+
+// Urine (4:1 diluted fermented)
+const float URINE_PH  = 8.5;
+const float URINE_EC  = 6.25;
+const float URINE_TAN = 200.0;
+const float URINE_FE  = 0.01;
+const float URINE_ZN  = 0.05;
+const float URINE_CU  = 0.01;
+const float URINE_MN  = 0.005;
+const float URINE_SE  = 0.001;
+const float URINE_NI  = 0.002;
+const float URINE_CO  = 0.001;
+
+// Spirulina (15 g/L)
+const float SPIR_PH  = 9.0;
+const float SPIR_EC  = 1.14;
+const float SPIR_TAN = 144.0;
+const float SPIR_FE  = 4.275;
+const float SPIR_ZN  = 0.300;
+const float SPIR_CU  = 0.915;
+const float SPIR_MN  = 0.285;
+const float SPIR_SE  = 0.00105;
+const float SPIR_NI  = 0.0;
+const float SPIR_CO  = 0.0;
+
+// === STATE VARIABLES ===
+unsigned long lastDoseTime = 0;
+float currentPH  = 7.0;
+float currentEC  = 5.5;
+float currentTAN = 80.0;
+
+// Trace metals (mg/L)
+float currentFe = 1.0;
+float currentZn = 0.1;
+float currentCu = 0.05;
+float currentMn = 0.1;
+float currentSe = 0.01;
+float currentNi = 0.01;
+float currentCo = 0.01;
+
+// Dose counters
+unsigned long dosesWine = 0;
+unsigned long dosesUrine = 0;
+unsigned long dosesSpirulina = 0;
 
 void setup() {
   Serial.begin(115200);
+  
   pinMode(PUMP_WINE, OUTPUT);
   pinMode(PUMP_URINE, OUTPUT);
   pinMode(PUMP_SPIRULINA, OUTPUT);
+  pinMode(STATUS_LED, OUTPUT);
   
   digitalWrite(PUMP_WINE, LOW);
   digitalWrite(PUMP_URINE, LOW);
   digitalWrite(PUMP_SPIRULINA, LOW);
   
-  Serial.println(F("=== MFC BASELINE CALIBRATION ==="));
-  Serial.println(F("Dosing all 3 pumps every minute"));
-  Serial.println(F("Adjusting dose times based on response"));
-  Serial.println(F("Tracking + calibrating trace metals"));
-  Serial.println();
-  
-  readSensors();
-  prevPH = pH;
-  prevEC = EC;
-  prevTAN = TAN;
+  printHeader();
 }
 
 void loop() {
-  // Store previous sensor readings
-  prevPH = pH;
-  prevEC = EC;
-  prevTAN = TAN;
+  unsigned long now = millis();
   
-  // Store previous metal estimates
-  prevFe = Fe;
-  prevZn = Zn;
-  prevCu = Cu;
-  prevMn = Mn;
-  prevSe = Se;
-  prevNi = Ni;
-  prevCo = Co;
-  
-  // Calculate dose volumes
-  float wineVol = wineDose * PUMP_RATE;
-  float urineVol = urineDose * PUMP_RATE;
-  float spirVol = spirulinaDose * PUMP_RATE;
-  
-  // Dose all three
-  Serial.println(F("--- DOSING ---"));
-  
-  Serial.print(F("WINE: ")); Serial.print(wineDose); Serial.print(F("s (~"));
-  Serial.print(wineVol); Serial.println(F(" mL)"));
-  digitalWrite(PUMP_WINE, HIGH);
-  delay(wineDose * 1000);
-  digitalWrite(PUMP_WINE, LOW);
-  mixMetals(WINE_FE, WINE_ZN, WINE_CU, WINE_MN, WINE_SE, WINE_NI, WINE_CO, wineVol);
-  
-  Serial.print(F("URINE: ")); Serial.print(urineDose); Serial.print(F("s (~"));
-  Serial.print(urineVol); Serial.println(F(" mL)"));
-  digitalWrite(PUMP_URINE, HIGH);
-  delay(urineDose * 1000);
-  digitalWrite(PUMP_URINE, LOW);
-  mixMetals(URINE_FE, URINE_ZN, URINE_CU, URINE_MN, URINE_SE, URINE_NI, URINE_CO, urineVol);
-  
-  Serial.print(F("SPIRULINA: ")); Serial.print(spirulinaDose); Serial.print(F("s (~"));
-  Serial.print(spirVol); Serial.println(F(" mL)"));
-  digitalWrite(PUMP_SPIRULINA, HIGH);
-  delay(spirulinaDose * 1000);
-  digitalWrite(PUMP_SPIRULINA, LOW);
-  mixMetals(SPIR_FE, SPIR_ZN, SPIR_CU, SPIR_MN, SPIR_SE, SPIR_NI, SPIR_CO, spirVol);
-  
-  // Wait remainder of minute
-  int doseTime = (wineDose + urineDose + spirulinaDose) * 1000;
-  int waitTime = 60000 - doseTime;
-  if (waitTime > 0) delay(waitTime);
-  
-  // Apply metal decay (1 minute elapsed)
-  applyMetalDecay();
-  
-  // Read sensors
-  readSensors();
-  
-  // Calculate sensor changes
-  float dPH = abs(pH - prevPH);
-  float dEC = abs(EC - prevEC);
-  float dTAN = abs(TAN - prevTAN);
-  
-  // Calculate metal changes
-  float dFe = Fe - prevFe;
-  float dZn = Zn - prevZn;
-  float dCu = Cu - prevCu;
-  float dMn = Mn - prevMn;
-  float dSe = Se - prevSe;
-  float dNi = Ni - prevNi;
-  float dCo = Co - prevCo;
-  
-  // Print sensor readings
-  Serial.println(F("--- SENSOR READINGS ---"));
-  Serial.print(F("pH:  ")); Serial.print(pH, 2); Serial.print(F("  delta: ")); Serial.println(dPH, 3);
-  Serial.print(F("EC:  ")); Serial.print(EC, 2); Serial.print(F("  delta: ")); Serial.println(dEC, 3);
-  Serial.print(F("TAN: ")); Serial.print(TAN, 1); Serial.print(F("  delta: ")); Serial.println(dTAN, 2);
-  Serial.print(F("Vol: ")); Serial.print(reactorVolume, 0); Serial.println(F(" mL"));
-  
-  // Print metals
-  printMetals();
-  
-  // Print metal deltas
-  Serial.println(F("--- METAL DELTAS ---"));
-  Serial.print(F("  dFe: ")); Serial.println(dFe, 4);
-  Serial.print(F("  dZn: ")); Serial.println(dZn, 4);
-  Serial.print(F("  dCu: ")); Serial.println(dCu, 4);
-  Serial.print(F("  dMn: ")); Serial.println(dMn, 4);
-  Serial.print(F("  dSe: ")); Serial.println(dSe, 5);
-  Serial.print(F("  dNi: ")); Serial.println(dNi, 5);
-  Serial.print(F("  dCo: ")); Serial.println(dCo, 5);
-  
-  Serial.println(F("--- CALIBRATION ---"));
-  
-  // Adjust wine based on pH
-  if (dPH < PH_MIN_CHANGE) {
-    wineDose++;
-    Serial.println(F("pH change too small -> wine +1s"));
-  } else if (dPH > PH_MAX_CHANGE) {
-    if (wineDose > 1) wineDose--;
-    Serial.println(F("pH change too big -> wine -1s"));
+  if (now - lastDoseTime >= DOSE_INTERVAL) {
+    lastDoseTime = now;
+    digitalWrite(STATUS_LED, HIGH);
+    
+    readSensors();
+    printStatus();
+    
+    int action = controlDecision();
+    executeAction(action);
+    
+    applyDrift();
+    
+    digitalWrite(STATUS_LED, LOW);
+    Serial.println();
   }
-  
-  // Adjust urine based on EC
-  if (dEC < EC_MIN_CHANGE) {
-    urineDose++;
-    Serial.println(F("EC change too small -> urine +1s"));
-  } else if (dEC > EC_MAX_CHANGE) {
-    if (urineDose > 1) urineDose--;
-    Serial.println(F("EC change too big -> urine -1s"));
-  }
-  
-  // Adjust spirulina based on TAN
-  if (dTAN < TAN_MIN_CHANGE) {
-    spirulinaDose++;
-    Serial.println(F("TAN change too small -> spirulina +1s"));
-  } else if (dTAN > TAN_MAX_CHANGE) {
-    if (spirulinaDose > 1) spirulinaDose--;
-    Serial.println(F("TAN change too big -> spirulina -1s"));
-  }
-  
-  // === METAL CALIBRATION ===
-  // Fe, Zn, Cu, Mn -> controlled by Spirulina
-  // Se, Ni, Co -> controlled by Urine
-  
-  // Fe (Spirulina)
-  if (dFe < FE_MIN_CHANGE) {
-    spirulinaDose++;
-    Serial.println(F("Fe change too small -> spirulina +1s"));
-  } else if (dFe > FE_MAX_CHANGE) {
-    if (spirulinaDose > 1) spirulinaDose--;
-    Serial.println(F("Fe change too big -> spirulina -1s"));
-  }
-  
-  // Zn (Spirulina)
-  if (dZn < ZN_MIN_CHANGE) {
-    spirulinaDose++;
-    Serial.println(F("Zn change too small -> spirulina +1s"));
-  } else if (dZn > ZN_MAX_CHANGE) {
-    if (spirulinaDose > 1) spirulinaDose--;
-    Serial.println(F("Zn change too big -> spirulina -1s"));
-  }
-  
-  // Cu (Spirulina)
-  if (dCu < CU_MIN_CHANGE) {
-    spirulinaDose++;
-    Serial.println(F("Cu change too small -> spirulina +1s"));
-  } else if (dCu > CU_MAX_CHANGE) {
-    if (spirulinaDose > 1) spirulinaDose--;
-    Serial.println(F("Cu change too big -> spirulina -1s"));
-  }
-  
-  // Mn (Spirulina)
-  if (dMn < MN_MIN_CHANGE) {
-    spirulinaDose++;
-    Serial.println(F("Mn change too small -> spirulina +1s"));
-  } else if (dMn > MN_MAX_CHANGE) {
-    if (spirulinaDose > 1) spirulinaDose--;
-    Serial.println(F("Mn change too big -> spirulina -1s"));
-  }
-  
-  // Se (Urine)
-  if (dSe < SE_MIN_CHANGE) {
-    urineDose++;
-    Serial.println(F("Se change too small -> urine +1s"));
-  } else if (dSe > SE_MAX_CHANGE) {
-    if (urineDose > 1) urineDose--;
-    Serial.println(F("Se change too big -> urine -1s"));
-  }
-  
-  // Ni (Urine)
-  if (dNi < NI_MIN_CHANGE) {
-    urineDose++;
-    Serial.println(F("Ni change too small -> urine +1s"));
-  } else if (dNi > NI_MAX_CHANGE) {
-    if (urineDose > 1) urineDose--;
-    Serial.println(F("Ni change too big -> urine -1s"));
-  }
-  
-  // Co (Urine)
-  if (dCo < CO_MIN_CHANGE) {
-    urineDose++;
-    Serial.println(F("Co change too small -> urine +1s"));
-  } else if (dCo > CO_MAX_CHANGE) {
-    if (urineDose > 1) urineDose--;
-    Serial.println(F("Co change too big -> urine -1s"));
-  }
-  
-  Serial.println();
-  Serial.print(F("Next doses: W=")); Serial.print(wineDose);
-  Serial.print(F("s U=")); Serial.print(urineDose);
-  Serial.print(F("s S=")); Serial.print(spirulinaDose); Serial.println(F("s"));
-  Serial.println(F("================================"));
-  Serial.println();
+}
+
+void printHeader() {
+  Serial.println(F("========================================"));
+  Serial.println(F("MFC Primitive Baseline Controller"));
+  Serial.println(F("Simple bang-bang with fixed 5mL doses"));
+  Serial.println(F("========================================"));
+  Serial.print(F("Drift: pH ")); Serial.print(D_PH, 4);
+  Serial.print(F("/min, EC ")); Serial.print(D_EC, 3);
+  Serial.print(F("/min, TAN ")); Serial.print(D_TAN, 1);
+  Serial.println(F("/min"));
+  Serial.println(F("----------------------------------------"));
+  Serial.println(F("Targets:"));
+  Serial.print(F("  pH:  ")); Serial.print(PH_MIN); Serial.print(F(" - ")); Serial.println(PH_MAX);
+  Serial.print(F("  EC:  ")); Serial.print(EC_MIN); Serial.print(F(" - ")); Serial.print(EC_MAX); Serial.println(F(" mS/cm"));
+  Serial.print(F("  TAN: ")); Serial.print(TAN_MIN); Serial.print(F(" - ")); Serial.print(TAN_MAX); Serial.println(F(" mg-N/L"));
+  Serial.println(F("========================================\n"));
 }
 
 void readSensors() {
   long phRaw = 0, ecRaw = 0, tanRaw = 0;
   
   for (int i = 0; i < 10; i++) {
-    phRaw += analogRead(PH_SENSOR);
-    ecRaw += analogRead(EC_SENSOR);
+    phRaw  += analogRead(PH_SENSOR);
+    ecRaw  += analogRead(EC_SENSOR);
     tanRaw += analogRead(NH4_SENSOR);
     delay(10);
   }
+  phRaw  /= 10;
+  ecRaw  /= 10;
+  tanRaw /= 10;
   
-  pH = PH_SLOPE * (phRaw / 10) + PH_OFFSET;
-  EC = EC_SLOPE * (ecRaw / 10) + EC_OFFSET;
-  TAN = TAN_SLOPE * (tanRaw / 10) + TAN_OFFSET;
+  currentPH  = PH_SLOPE * phRaw + PH_OFFSET;
+  currentEC  = EC_SLOPE * ecRaw + EC_OFFSET;
+  currentTAN = TAN_SLOPE * tanRaw + TAN_OFFSET;
+  
+  currentPH  = constrain(currentPH, 0.0, 14.0);
+  currentEC  = constrain(currentEC, 0.0, 50.0);
+  currentTAN = constrain(currentTAN, 0.0, 1000.0);
 }
 
-// CSTR mixing: x_new = (x_reactor * V_reactor + x_input * V_dose) / (V_reactor + V_dose)
-void mixMetals(float inFe, float inZn, float inCu, float inMn, float inSe, float inNi, float inCo, float doseVol) {
-  float newVol = reactorVolume + doseVol;
+int controlDecision() {
+  // Priority 1: pH
+  if (currentPH > PH_MAX) return 1;  // Wine
+  if (currentPH < PH_MIN) return 2;  // Urine
   
-  Fe = (Fe * reactorVolume + inFe * doseVol) / newVol;
-  Zn = (Zn * reactorVolume + inZn * doseVol) / newVol;
-  Cu = (Cu * reactorVolume + inCu * doseVol) / newVol;
-  Mn = (Mn * reactorVolume + inMn * doseVol) / newVol;
-  Se = (Se * reactorVolume + inSe * doseVol) / newVol;
-  Ni = (Ni * reactorVolume + inNi * doseVol) / newVol;
-  Co = (Co * reactorVolume + inCo * doseVol) / newVol;
+  // Priority 2 & 3: TAN and EC
+  if (currentTAN < TAN_MIN && currentEC < EC_MIN) return 2;
+  if (currentTAN < TAN_MIN) return 3;  // Spirulina
+  if (currentEC < EC_MIN) return 2;    // Urine
+  
+  return 0;
+}
+
+void executeAction(int action) {
+  switch (action) {
+    case 1:
+      Serial.println(F(">> DOSE WINE (pH high)"));
+      doseWine();
+      break;
+    case 2:
+      if (currentPH < PH_MIN) {
+        Serial.println(F(">> DOSE URINE (pH low)"));
+      } else if (currentTAN < TAN_MIN && currentEC < EC_MIN) {
+        Serial.println(F(">> DOSE URINE (TAN+EC)"));
+      } else {
+        Serial.println(F(">> DOSE URINE (EC low)"));
+      }
+      doseUrine();
+      break;
+    case 3:
+      Serial.println(F(">> DOSE SPIRULINA (TAN)"));
+      doseSpirulina();
+      break;
+    default:
+      Serial.println(F(">> All OK - no dosing"));
+      break;
+  }
+}
+
+void doseWine() {
+  float newVol = reactorVolume + DOSE_VOLUME;
+  
+  currentPH  = (currentPH * reactorVolume + WINE_PH * DOSE_VOLUME) / newVol;
+  currentEC  = (currentEC * reactorVolume + WINE_EC * DOSE_VOLUME) / newVol;
+  currentTAN = (currentTAN * reactorVolume + WINE_TAN * DOSE_VOLUME) / newVol;
+  
+  currentFe = (currentFe * reactorVolume + WINE_FE * DOSE_VOLUME) / newVol;
+  currentZn = (currentZn * reactorVolume + WINE_ZN * DOSE_VOLUME) / newVol;
+  currentCu = (currentCu * reactorVolume + WINE_CU * DOSE_VOLUME) / newVol;
+  currentMn = (currentMn * reactorVolume + WINE_MN * DOSE_VOLUME) / newVol;
+  currentSe = (currentSe * reactorVolume + WINE_SE * DOSE_VOLUME) / newVol;
+  currentNi = (currentNi * reactorVolume + WINE_NI * DOSE_VOLUME) / newVol;
+  currentCo = (currentCo * reactorVolume + WINE_CO * DOSE_VOLUME) / newVol;
   
   reactorVolume = newVol;
+  dosesWine++;
+  
+  digitalWrite(PUMP_WINE, HIGH);
+  delay(DOSE_TIME_SEC * 1000);
+  digitalWrite(PUMP_WINE, LOW);
 }
 
-// First-order decay: Metal(t+dt) = Metal(t) * exp(-k * dt)
-void applyMetalDecay() {
-  float decay = exp(-METAL_DECAY);  // dt = 1 min
-  Fe *= decay;
-  Zn *= decay;
-  Cu *= decay;
-  Mn *= decay;
-  Se *= decay;
-  Ni *= decay;
-  Co *= decay;
+void doseUrine() {
+  float newVol = reactorVolume + DOSE_VOLUME;
+  
+  currentPH  = (currentPH * reactorVolume + URINE_PH * DOSE_VOLUME) / newVol;
+  currentEC  = (currentEC * reactorVolume + URINE_EC * DOSE_VOLUME) / newVol;
+  currentTAN = (currentTAN * reactorVolume + URINE_TAN * DOSE_VOLUME) / newVol;
+  
+  currentFe = (currentFe * reactorVolume + URINE_FE * DOSE_VOLUME) / newVol;
+  currentZn = (currentZn * reactorVolume + URINE_ZN * DOSE_VOLUME) / newVol;
+  currentCu = (currentCu * reactorVolume + URINE_CU * DOSE_VOLUME) / newVol;
+  currentMn = (currentMn * reactorVolume + URINE_MN * DOSE_VOLUME) / newVol;
+  currentSe = (currentSe * reactorVolume + URINE_SE * DOSE_VOLUME) / newVol;
+  currentNi = (currentNi * reactorVolume + URINE_NI * DOSE_VOLUME) / newVol;
+  currentCo = (currentCo * reactorVolume + URINE_CO * DOSE_VOLUME) / newVol;
+  
+  reactorVolume = newVol;
+  dosesUrine++;
+  
+  digitalWrite(PUMP_URINE, HIGH);
+  delay(DOSE_TIME_SEC * 1000);
+  digitalWrite(PUMP_URINE, LOW);
 }
 
-void printMetals() {
-  Serial.println(F("--- TRACE METALS (mg/L) ---"));
-  printMetal("Fe", Fe, FE_MIN, FE_MAX);
-  printMetal("Zn", Zn, ZN_MIN, ZN_MAX);
-  printMetal("Cu", Cu, CU_MIN, CU_MAX);
-  printMetal("Mn", Mn, MN_MIN, MN_MAX);
-  printMetal("Se", Se, SE_MIN, SE_MAX);
-  printMetal("Ni", Ni, NI_MIN, NI_MAX);
-  printMetal("Co", Co, CO_MIN, CO_MAX);
+void doseSpirulina() {
+  float newVol = reactorVolume + DOSE_VOLUME;
+  
+  currentPH  = (currentPH * reactorVolume + SPIR_PH * DOSE_VOLUME) / newVol;
+  currentEC  = (currentEC * reactorVolume + SPIR_EC * DOSE_VOLUME) / newVol;
+  currentTAN = (currentTAN * reactorVolume + SPIR_TAN * DOSE_VOLUME) / newVol;
+  
+  currentFe = (currentFe * reactorVolume + SPIR_FE * DOSE_VOLUME) / newVol;
+  currentZn = (currentZn * reactorVolume + SPIR_ZN * DOSE_VOLUME) / newVol;
+  currentCu = (currentCu * reactorVolume + SPIR_CU * DOSE_VOLUME) / newVol;
+  currentMn = (currentMn * reactorVolume + SPIR_MN * DOSE_VOLUME) / newVol;
+  currentSe = (currentSe * reactorVolume + SPIR_SE * DOSE_VOLUME) / newVol;
+  currentNi = (currentNi * reactorVolume + SPIR_NI * DOSE_VOLUME) / newVol;
+  currentCo = (currentCo * reactorVolume + SPIR_CO * DOSE_VOLUME) / newVol;
+  
+  reactorVolume = newVol;
+  dosesSpirulina++;
+  
+  digitalWrite(PUMP_SPIRULINA, HIGH);
+  delay(DOSE_TIME_SEC * 1000);
+  digitalWrite(PUMP_SPIRULINA, LOW);
 }
 
-void printMetal(const char* name, float val, float lo, float hi) {
-  Serial.print(F("  "));
-  Serial.print(name);
-  Serial.print(F(": "));
-  Serial.print(val, 4);
-  if (val < lo) Serial.print(F(" [LOW]"));
-  else if (val > hi) Serial.print(F(" [HIGH]"));
-  else Serial.print(F(" [OK]"));
-  Serial.print(F("  ("));
-  Serial.print(lo, 2);
-  Serial.print(F("-"));
-  Serial.print(hi, 2);
-  Serial.println(F(")"));
+void applyDrift() {
+  // Constant drift only - no state-dependent decay
+  currentPH  += D_PH;
+  currentEC  += D_EC;
+  currentTAN += D_TAN;
+  
+  // Metal decay
+  float decayFactor = exp(-METAL_DECAY_RATE);
+  currentFe *= decayFactor;
+  currentZn *= decayFactor;
+  currentCu *= decayFactor;
+  currentMn *= decayFactor;
+  currentSe *= decayFactor;
+  currentNi *= decayFactor;
+  currentCo *= decayFactor;
+  
+  currentPH  = max(0.0, currentPH);
+  currentEC  = max(0.01, currentEC);
+  currentTAN = max(0.0, currentTAN);
+}
+
+void printStatus() {
+  Serial.print(F("pH: ")); Serial.print(currentPH, 2);
+  Serial.print(F(" | EC: ")); Serial.print(currentEC, 2);
+  Serial.print(F(" | TAN: ")); Serial.print(currentTAN, 1);
+  Serial.print(F(" | Vol: ")); Serial.print(reactorVolume, 0);
+  Serial.print(F(" | W:")); Serial.print(dosesWine);
+  Serial.print(F(" U:")); Serial.print(dosesUrine);
+  Serial.print(F(" S:")); Serial.println(dosesSpirulina);
 }
