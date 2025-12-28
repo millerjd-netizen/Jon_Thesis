@@ -8,7 +8,7 @@
 // - Calculates exact dose volume needed to reach setpoint
 // - Doses ONE substrate at a time
 // - Evaluates every 1 minute
-// - Priority: pH > TAN > EC
+// - Priority: pH > DO > EC
 // ============================================
 
 // === PIN DEFINITIONS ===
@@ -18,7 +18,7 @@
 #define STATUS_LED     3   // D3 - Status LED
 #define PH_SENSOR      A0  // Analog pH input
 #define EC_SENSOR      A1  // Analog EC input
-#define NH4_SENSOR     A2  // Analog ammonia input
+#define DO_SENSOR      A2  // Analog dissolved oxygen input
 
 // === TARGET SETPOINTS ===
 const float PH_SETPOINT   = 7.0;
@@ -27,9 +27,13 @@ const float PH_MAX        = 7.2;
 const float EC_SETPOINT   = 7.5;   // mS/cm
 const float EC_MIN        = 5.0;
 const float EC_MAX        = 10.0;
-const float TAN_SETPOINT  = 125.0; // mg-N/L
-const float TAN_MIN       = 50.0;
-const float TAN_MAX       = 200.0;
+const float DO_SETPOINT   = 6.0;   // mg/L
+const float DO_MIN        = 4.0;   // mg/L (below this is hypoxic)
+const float DO_MAX        = 8.0;   // mg/L
+
+// === DO SATURATION AND REAERATION ===
+const float DO_SATURATION = 8.5;   // mg/L at ~20°C, 1 atm
+const float KLA           = 0.1;   // reaeration coefficient (per minute)
 
 // === TRACE METAL TARGETS (mg/L) - tracked, not controlled ===
 const float FE_MIN = 1.0,  FE_MAX = 10.0;
@@ -56,23 +60,37 @@ const float PH_SLOPE      = -0.0178;
 const float PH_OFFSET     = 21.34;
 const float EC_SLOPE      = 0.0244;
 const float EC_OFFSET     = 0.0;
-const float TAN_SLOPE     = 0.488;
-const float TAN_OFFSET    = 0.0;
+const float DO_SLOPE      = 0.0195;  // Calibrated for DO probe
+const float DO_OFFSET     = 0.0;
 
-// === AUTONOMOUS DYNAMICS (for drift simulation/prediction) ===
+// === AUTONOMOUS DYNAMICS ===
+// State equation: dx/dt = Ax + d
+// For DO: dDO/dt = A_DO*DO + D_DO + kLa*(DO_sat - DO)
+//
+// The DO equation models:
+//   - A_DO*DO:  Biomass-dependent O2 consumption (more DO = faster uptake)
+//   - D_DO:     Baseline O2 consumption (respiration, oxidation)
+//   - kLa*(DO_sat - DO): Reaeration (O2 transfer from atmosphere)
+//
+// At steady state (no inputs):
+//   DO_ss = (D_DO + kLa*DO_sat) / (kLa - A_DO)
+//   With current params: DO_ss ≈ 6.67 mg/L
+
 const float A_PH  = -0.0001;   // per minute
 const float A_EC  = -0.0001;   // per minute
-const float A_TAN = -0.00003;  // per minute
-const float D_PH  = -0.0005;   // pH/min
-const float D_EC  = -0.001;    // mS/cm/min
-const float D_TAN = -0.3;      // mg-N/L/min
+const float A_DO  = -0.005;    // per minute (DO-dependent consumption)
+
+const float D_PH  = -0.0005;   // pH/min (CO2/VFA production)
+const float D_EC  = -0.001;    // mS/cm/min (ion uptake)
+const float D_DO  = -0.15;     // mg/L/min (baseline O2 consumption)
+
 const float METAL_DECAY_RATE = 0.0005; // per minute
 
 // === SUBSTRATE PROPERTIES ===
-// Wine (100:1 diluted)
+// Wine (100:1 diluted) - organic load consumes O2
 const float WINE_PH  = 4.0;
 const float WINE_EC  = 0.02;
-const float WINE_TAN = 0.1;
+const float WINE_DO  = 2.0;    // Low DO (organics strip oxygen)
 const float WINE_FE  = 0.05;
 const float WINE_ZN  = 0.01;
 const float WINE_CU  = 0.001;
@@ -81,10 +99,10 @@ const float WINE_SE  = 0.0;
 const float WINE_NI  = 0.0;
 const float WINE_CO  = 0.0;
 
-// Urine (4:1 diluted fermented)
+// Urine (4:1 diluted fermented) - moderate DO
 const float URINE_PH  = 8.5;
 const float URINE_EC  = 6.25;
-const float URINE_TAN = 200.0;
+const float URINE_DO  = 3.0;   // Low-moderate DO (ammonia oxidation demand)
 const float URINE_FE  = 0.01;
 const float URINE_ZN  = 0.05;
 const float URINE_CU  = 0.01;
@@ -93,10 +111,10 @@ const float URINE_SE  = 0.001;
 const float URINE_NI  = 0.002;
 const float URINE_CO  = 0.001;
 
-// Spirulina (15 g/L)
+// Spirulina (15 g/L) - photosynthetic, high DO
 const float SPIR_PH  = 9.0;
 const float SPIR_EC  = 1.14;
-const float SPIR_TAN = 144.0;
+const float SPIR_DO  = 12.0;   // Supersaturated from photosynthesis
 const float SPIR_FE  = 4.275;
 const float SPIR_ZN  = 0.300;
 const float SPIR_CU  = 0.915;
@@ -109,7 +127,7 @@ const float SPIR_CO  = 0.0;
 unsigned long lastControlTime = 0;
 float currentPH  = 7.0;
 float currentEC  = 5.5;
-float currentTAN = 80.0;
+float currentDO  = 6.0;   // mg/L
 
 // Trace metals (mg/L) - estimated, not measured
 float currentFe = 1.0;
@@ -197,33 +215,24 @@ int mpcControlDecision(float* doseML, char* reason) {
     }
   }
   
-  // === PRIORITY 2 & 3: TAN and EC combined logic ===
-  if (currentTAN < TAN_MIN && currentEC < EC_MIN) {
-    // Both low - urine provides both TAN and EC
-    float dose = calculateDoseVolume(currentTAN, TAN_SETPOINT, URINE_TAN, reactorVolume);
+  // === PRIORITY 2: DO control (critical for aerobic processes) ===
+  if (currentDO < DO_MIN) {
+    // DO too low - need spirulina (photosynthetic O2)
+    float dose = calculateDoseVolume(currentDO, DO_SETPOINT, SPIR_DO, reactorVolume);
     if (dose >= MIN_DOSE_ML) {
       *doseML = dose;
-      sprintf(reason, "TAN+EC LOW (TAN=%.1f, EC=%.2f) -> urine", currentTAN, currentEC);
-      return 2;
-    }
-  }
-  
-  if (currentTAN < TAN_MIN) {
-    // TAN low, EC is OK - use spirulina
-    float dose = calculateDoseVolume(currentTAN, TAN_SETPOINT, SPIR_TAN, reactorVolume);
-    if (dose >= MIN_DOSE_ML) {
-      *doseML = dose;
-      sprintf(reason, "TAN LOW (%.1f<%.1f) -> spirulina", currentTAN, TAN_MIN);
+      sprintf(reason, "DO LOW (%.2f<%.1f) -> spirulina to %.1f", currentDO, DO_MIN, DO_SETPOINT);
       return 3;
     }
   }
   
+  // === PRIORITY 3: EC control ===
   if (currentEC < EC_MIN) {
-    // EC low, TAN is OK - use urine for EC
+    // EC low - use urine for EC
     float dose = calculateDoseVolume(currentEC, EC_SETPOINT, URINE_EC, reactorVolume);
     if (dose >= MIN_DOSE_ML) {
       *doseML = dose;
-      sprintf(reason, "EC LOW (%.2f<%.1f) -> urine", currentEC, EC_MIN);
+      sprintf(reason, "EC LOW (%.2f<%.1f) -> urine to %.1f", currentEC, EC_MIN, EC_SETPOINT);
       return 2;
     }
   }
@@ -241,14 +250,14 @@ void executeDose(int substrate, float doseML) {
   if (doseML < MIN_DOSE_ML) return;
   
   int pumpPin;
-  float subPH, subEC, subTAN;
+  float subPH, subEC, subDO;
   float subFe, subZn, subCu, subMn, subSe, subNi, subCo;
   const char* name;
   
   switch (substrate) {
     case 1: // Wine
       pumpPin = PUMP_WINE;
-      subPH = WINE_PH; subEC = WINE_EC; subTAN = WINE_TAN;
+      subPH = WINE_PH; subEC = WINE_EC; subDO = WINE_DO;
       subFe = WINE_FE; subZn = WINE_ZN; subCu = WINE_CU;
       subMn = WINE_MN; subSe = WINE_SE; subNi = WINE_NI; subCo = WINE_CO;
       name = "WINE";
@@ -258,7 +267,7 @@ void executeDose(int substrate, float doseML) {
       
     case 2: // Urine
       pumpPin = PUMP_URINE;
-      subPH = URINE_PH; subEC = URINE_EC; subTAN = URINE_TAN;
+      subPH = URINE_PH; subEC = URINE_EC; subDO = URINE_DO;
       subFe = URINE_FE; subZn = URINE_ZN; subCu = URINE_CU;
       subMn = URINE_MN; subSe = URINE_SE; subNi = URINE_NI; subCo = URINE_CO;
       name = "URINE";
@@ -268,7 +277,7 @@ void executeDose(int substrate, float doseML) {
       
     case 3: // Spirulina
       pumpPin = PUMP_SPIRULINA;
-      subPH = SPIR_PH; subEC = SPIR_EC; subTAN = SPIR_TAN;
+      subPH = SPIR_PH; subEC = SPIR_EC; subDO = SPIR_DO;
       subFe = SPIR_FE; subZn = SPIR_ZN; subCu = SPIR_CU;
       subMn = SPIR_MN; subSe = SPIR_SE; subNi = SPIR_NI; subCo = SPIR_CO;
       name = "SPIRULINA";
@@ -293,11 +302,11 @@ void executeDose(int substrate, float doseML) {
   float newVol = reactorVolume + doseML;
   float newPH  = (currentPH * reactorVolume + subPH * doseML) / newVol;
   float newEC  = (currentEC * reactorVolume + subEC * doseML) / newVol;
-  float newTAN = (currentTAN * reactorVolume + subTAN * doseML) / newVol;
+  float newDO  = (currentDO * reactorVolume + subDO * doseML) / newVol;
   
   Serial.print(F("   Expected: pH=")); Serial.print(newPH, 2);
   Serial.print(F(" EC=")); Serial.print(newEC, 2);
-  Serial.print(F(" TAN=")); Serial.println(newTAN, 1);
+  Serial.print(F(" DO=")); Serial.println(newDO, 2);
   
   // Activate pump
   digitalWrite(pumpPin, HIGH);
@@ -305,9 +314,9 @@ void executeDose(int substrate, float doseML) {
   digitalWrite(pumpPin, LOW);
   
   // Update state using CSTR mixing physics
-  currentPH  = (currentPH * reactorVolume + subPH * doseML) / newVol;
-  currentEC  = (currentEC * reactorVolume + subEC * doseML) / newVol;
-  currentTAN = (currentTAN * reactorVolume + subTAN * doseML) / newVol;
+  currentPH = (currentPH * reactorVolume + subPH * doseML) / newVol;
+  currentEC = (currentEC * reactorVolume + subEC * doseML) / newVol;
+  currentDO = (currentDO * reactorVolume + subDO * doseML) / newVol;
   
   // Update trace metals
   currentFe = (currentFe * reactorVolume + subFe * doseML) / newVol;
@@ -326,44 +335,59 @@ void executeDose(int substrate, float doseML) {
 // ============================================
 
 void readSensors() {
-  long phRaw = 0, ecRaw = 0, tanRaw = 0;
+  long phRaw = 0, ecRaw = 0, doRaw = 0;
   
   // Average 10 readings for noise reduction
   for (int i = 0; i < 10; i++) {
-    phRaw  += analogRead(PH_SENSOR);
-    ecRaw  += analogRead(EC_SENSOR);
-    tanRaw += analogRead(NH4_SENSOR);
+    phRaw += analogRead(PH_SENSOR);
+    ecRaw += analogRead(EC_SENSOR);
+    doRaw += analogRead(DO_SENSOR);
     delay(10);
   }
-  phRaw  /= 10;
-  ecRaw  /= 10;
-  tanRaw /= 10;
+  phRaw /= 10;
+  ecRaw /= 10;
+  doRaw /= 10;
   
   // Convert to units
-  currentPH  = PH_SLOPE * phRaw + PH_OFFSET;
-  currentEC  = EC_SLOPE * ecRaw + EC_OFFSET;
-  currentTAN = TAN_SLOPE * tanRaw + TAN_OFFSET;
+  currentPH = PH_SLOPE * phRaw + PH_OFFSET;
+  currentEC = EC_SLOPE * ecRaw + EC_OFFSET;
+  currentDO = DO_SLOPE * doRaw + DO_OFFSET;
   
   // Constrain to valid ranges
-  currentPH  = constrain(currentPH, 0.0, 14.0);
-  currentEC  = constrain(currentEC, 0.0, 50.0);
-  currentTAN = constrain(currentTAN, 0.0, 1000.0);
+  currentPH = constrain(currentPH, 0.0, 14.0);
+  currentEC = constrain(currentEC, 0.0, 50.0);
+  currentDO = constrain(currentDO, 0.0, 20.0);  // Can be supersaturated
 }
 
 // ============================================
-// DRIFT APPLICATION (for simulation/prediction)
+// DRIFT APPLICATION (autonomous dynamics)
 // ============================================
+// 
+// pH, EC: dx/dt = Ax + d (first-order decay + constant drift)
+// DO:     dDO/dt = A_DO*DO + D_DO + kLa*(DO_sat - DO)
+//
+// The DO equation correctly models:
+//   - Consumption proportional to DO (A_DO*DO, negative)
+//   - Baseline consumption (D_DO, negative)  
+//   - Reaeration toward saturation (kLa*(DO_sat - DO), positive when DO < sat)
 
 void applyDrift(float dt) {
-  // State-dependent decay (Ax) + constant drift (d)
-  float dPH  = A_PH * currentPH + D_PH;
-  float dEC  = A_EC * currentEC + D_EC;
-  float dTAN = A_TAN * currentTAN + D_TAN;
+  // pH dynamics: first-order decay + constant drift
+  float dPH = A_PH * currentPH + D_PH;
+  
+  // EC dynamics: first-order decay + constant drift
+  float dEC = A_EC * currentEC + D_EC;
+  
+  // DO dynamics: consumption + reaeration
+  // dDO/dt = A_DO*DO + D_DO + kLa*(DO_sat - DO)
+  float consumption = A_DO * currentDO + D_DO;           // Negative (O2 consumed)
+  float reaeration  = KLA * (DO_SATURATION - currentDO); // Positive when DO < sat
+  float dDO = consumption + reaeration;
   
   // Euler integration
-  currentPH  += dPH * dt;
-  currentEC  += dEC * dt;
-  currentTAN += dTAN * dt;
+  currentPH += dPH * dt;
+  currentEC += dEC * dt;
+  currentDO += dDO * dt;
   
   // Metal decay (first-order)
   float decayFactor = exp(-METAL_DECAY_RATE * dt);
@@ -375,10 +399,11 @@ void applyDrift(float dt) {
   currentNi *= decayFactor;
   currentCo *= decayFactor;
   
-  // Enforce non-negative
-  currentPH  = max(0.0, currentPH);
-  currentEC  = max(0.01, currentEC);
-  currentTAN = max(0.0, currentTAN);
+  // Enforce physical constraints
+  currentPH = max(0.0, currentPH);
+  currentEC = max(0.01, currentEC);
+  currentDO = max(0.0, currentDO);      // Can't go negative
+  currentDO = min(currentDO, 20.0);     // Cap at supersaturation limit
 }
 
 // ============================================
@@ -408,15 +433,16 @@ void printStatus() {
   Serial.print(F("  (target: ")); Serial.print(EC_MIN); 
   Serial.print(F("-")); Serial.print(EC_MAX); Serial.println(F(")"));
   
-  // TAN
-  Serial.print(F("TAN: "));
-  Serial.print(currentTAN, 1);
-  Serial.print(F(" mg-N/L"));
-  if (currentTAN < TAN_MIN) Serial.print(F(" [LOW]"));
-  else if (currentTAN > TAN_MAX) Serial.print(F(" [HIGH]"));
+  // DO
+  Serial.print(F("DO:  "));
+  Serial.print(currentDO, 2);
+  Serial.print(F(" mg/L"));
+  if (currentDO < DO_MIN) Serial.print(F(" [LOW]"));
+  else if (currentDO > DO_MAX) Serial.print(F(" [HIGH]"));
   else Serial.print(F(" [OK]"));
-  Serial.print(F("  (target: ")); Serial.print(TAN_MIN); 
-  Serial.print(F("-")); Serial.print(TAN_MAX); Serial.println(F(")"));
+  Serial.print(F("  (target: ")); Serial.print(DO_MIN); 
+  Serial.print(F("-")); Serial.print(DO_MAX);
+  Serial.print(F(", sat: ")); Serial.print(DO_SATURATION); Serial.println(F(")"));
   
   // Volume
   Serial.print(F("Vol: "));
@@ -502,23 +528,31 @@ void setup() {
   Serial.println(F("CSTR mixing equation:"));
   Serial.println(F("  V_dose = V * (target - current) / (substrate - target)"));
   Serial.println(F(""));
+  Serial.println(F("DO Dynamics Model:"));
+  Serial.println(F("  dDO/dt = A_DO*DO + D_DO + kLa*(DO_sat - DO)"));
+  Serial.print(F("  A_DO = ")); Serial.print(A_DO, 4); Serial.println(F(" /min (consumption coeff)"));
+  Serial.print(F("  D_DO = ")); Serial.print(D_DO, 2); Serial.println(F(" mg/L/min (base consumption)"));
+  Serial.print(F("  kLa  = ")); Serial.print(KLA, 2); Serial.println(F(" /min (reaeration)"));
+  Serial.print(F("  DO_sat = ")); Serial.print(DO_SATURATION, 1); Serial.println(F(" mg/L"));
+  Serial.println(F("  Steady-state DO (no input) ≈ 6.67 mg/L"));
+  Serial.println(F(""));
   Serial.print(F("Dose range: ")); Serial.print(MIN_DOSE_ML, 1);
   Serial.print(F(" - ")); Serial.print(MAX_DOSE_ML, 1); Serial.println(F(" mL"));
   Serial.print(F("Control interval: ")); Serial.print(CONTROL_INTERVAL/1000);
   Serial.println(F(" seconds"));
   Serial.println(F(""));
   Serial.println(F("Targets:"));
-  Serial.print(F("  pH:  ")); Serial.print(PH_MIN); Serial.print(F("-")); 
+  Serial.print(F("  pH: ")); Serial.print(PH_MIN); Serial.print(F("-")); 
   Serial.print(PH_MAX); Serial.print(F(" (setpoint ")); 
   Serial.print(PH_SETPOINT); Serial.println(F(")"));
-  Serial.print(F("  EC:  ")); Serial.print(EC_MIN); Serial.print(F("-")); 
+  Serial.print(F("  EC: ")); Serial.print(EC_MIN); Serial.print(F("-")); 
   Serial.print(EC_MAX); Serial.print(F(" mS/cm (setpoint "));
   Serial.print(EC_SETPOINT); Serial.println(F(")"));
-  Serial.print(F("  TAN: ")); Serial.print(TAN_MIN); Serial.print(F("-")); 
-  Serial.print(TAN_MAX); Serial.print(F(" mg-N/L (setpoint "));
-  Serial.print(TAN_SETPOINT); Serial.println(F(")"));
+  Serial.print(F("  DO: ")); Serial.print(DO_MIN); Serial.print(F("-")); 
+  Serial.print(DO_MAX); Serial.print(F(" mg/L (setpoint "));
+  Serial.print(DO_SETPOINT); Serial.println(F(")"));
   Serial.println(F(""));
-  Serial.println(F("Priority: pH > TAN > EC"));
+  Serial.println(F("Priority: pH > DO > EC"));
   Serial.println(F("============================================"));
   Serial.println(F(""));
 }
@@ -558,6 +592,9 @@ void loop() {
       printMetals();
       cycleCount = 0;
     }
+    
+    // Apply drift for next cycle (dt = 1 minute)
+    applyDrift(1.0);
     
     digitalWrite(STATUS_LED, LOW);
     Serial.println();
