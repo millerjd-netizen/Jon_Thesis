@@ -1,176 +1,87 @@
-# Jon_Thesis — MFC Control System (Arduino Giga)
+# MFC Feedback Control Simulation
 
-Arduino-based dosing control for a microbial fuel cell (MFC) system using three inputs:
-- Diluted synthetic winery wastewater ("wine") — 100:1 dilution, pH 4.0
-- Diluted fully fermented urine — 4:1 dilution, pH 8.5, EC 6.25 mS/cm
-- Spirulina solution — 15 g/L, pH 9.0, EC 1.14 mS/cm
+Python simulation for Master's thesis on Microbial Fuel Cell (MFC) control systems. Compares experimental feedback controller vs bang-bang baseline controller.
 
-## State Space Formulation
+## System Overview
 
-The system is modeled as:
+- **Reactor Volume**: 1 L
+- **Flow Rate**: 45 mL/L/h (0.75 mL/min)
+- **HRT**: ~22 hours
+- **Simulation Duration**: 2 days (2880 minutes)
+- **Perturbation**: 10g citric acid at day 1
 
+## Inputs (3 Substrates)
+
+| Substrate | pH | EC (mS/cm) | COD (mg/g) | Notes |
+|-----------|-----|------------|------------|-------|
+| Fermented Urine | 9.3 | 45.0 | 3.0 | Alkaline, very high EC |
+| Fermented Winery WW | 3.5 | 8.0 | 200.0 | Acidic, lowest EC |
+| Lysed Spirulina | 7.2 | 12.0 | 1100.0 | Neutral, high trace metals |
+
+## Target Ranges
+
+| Parameter | Target Range |
+|-----------|-------------|
+| pH | 6.8 - 7.2 |
+| EC | 5.0 - 10.0 mS/cm |
+| ORP | -300 to -100 mV |
+| Trace Metals | 2.0 - 5.0 mg/L |
+| Voltage | > 200 mV |
+
+## Control Strategies
+
+### Bang-Bang (Control Group)
+- Only doses when parameter is OUT OF RANGE
+- Simple threshold-based switching
+- No proportional control
+
+### Feedback (Experimental Group)
+- Priority-based decision making
+- Considers EC impact before dosing urine
+- Balances pH, EC, and trace metal targets
+
+## Output
+
+Arduino-style serial monitor output every minute:
 ```
-ẋ = Ax + Bu + d
-```
-
-Where:
-- **x** = [pH, EC, TAN]ᵀ — state vector
-- **u** = [Q_wine, Q_urine, Q_spirulina]ᵀ — input vector (flow rates, mL/min)
-- **A** — autonomous dynamics matrix (biological decay)
-- **B** — input coupling matrix (mixing physics)
-- **d** — constant drift vector (zero-order consumption)
-
-### State Variables
-
-| State | Description | Target Range | Units |
-|-------|-------------|--------------|-------|
-| pH | Hydrogen ion activity | 6.8 – 7.2 | — |
-| EC | Electrical conductivity | 5.0 – 10.0 | mS/cm |
-| TAN | Total ammonia nitrogen | 50 – 200 | mg-N/L |
-
-### Autonomous Dynamics (A matrix + drift d)
-
-Without inputs, the system evolves according to ODEs:
-
-```
-d(pH)/dt  = -0.0001·pH - 0.0005      (CO₂/VFA production)
-d(EC)/dt  = -0.0001·EC - 0.001       (ion uptake by bacteria)
-d(TAN)/dt = -0.00003·TAN - 0.3       (bacterial assimilation)
-```
-
-These rates are approximately constant within the operating range (Batstone et al., *Water Sci. Tech.* 2002).
-
-### Input Coupling (B matrix)
-
-Dosing follows CSTR mixing physics:
-
-```
-x_new = (x_reactor × V_reactor + x_input × V_dose) / (V_reactor + V_dose)
-```
-
-| Input | pH | EC (mS/cm) | TAN (mg-N/L) | Effect |
-|-------|-----|------------|--------------|--------|
-| Wine | 4.0 | 0.02 | 0.1 | ↓ pH, ↓ EC, ↓ TAN |
-| Urine | 8.5 | 6.25 | 200 | ↑ pH, ↑ EC, ↑ TAN |
-| Spirulina | 9.0 | 1.14 | 144 | ↑ pH, ↓ EC*, ↑ TAN |
-
-*Spirulina EC (1.14) is lower than reactor target (5.0), so it dilutes EC.
-
-## Control Logic
-
-**Priority:** pH > TAN > EC > Metals
-
-Every control cycle (1 minute):
-1. Read sensors (pH, EC, TAN)
-2. Apply control decision based on priority
-3. Dose one input if needed
-4. Apply ODE drift dynamics
-5. Update trace metal estimates
-
-### Dosing Actions
-
-| Condition | Action | Reason |
-|-----------|--------|--------|
-| pH > 7.2 | Dose wine | Acid lowers pH |
-| pH < 6.8 | Dose urine | Base raises pH |
-| TAN < 50 AND EC < 5.0 | Dose urine | Provides both |
-| TAN < 50 AND EC ≥ 5.0 | Dose spirulina | TAN without diluting EC |
-| EC < 5.0 | Dose urine | High ionic content |
-| All in range | No action | — |
-
-## Trace Metals
-
-Trace metals are **tracked but not actively controlled**. Concentrations are estimated via mass balance using the same CSTR mixing physics as the primary states, with first-order decay (0.05%/min) to account for biological uptake.
-
-### Substrate Trace Metal Concentrations (mg/L)
-
-| Metal | Wine (100:1) | Urine (4:1) | Spirulina (15 g/L) | Target Range | Notes |
-|-------|--------------|-------------|--------------------|--------------| ------|
-| Fe | 0.05 | 0.01 | 4.275 | 1.0 – 10.0 | Spirulina is primary source |
-| Zn | 0.01 | 0.05 | 0.300 | 0.1 – 1.0 | All inputs contribute |
-| Cu | 0.001 | 0.01 | 0.915 | 0.01 – 0.5 | ⚠ Spirulina may exceed target |
-| Mn | 0.02 | 0.005 | 0.285 | 0.1 – 1.0 | Spirulina is primary source |
-| Se | 0.0 | 0.001 | 0.00105 | 0.01 – 0.1 | Low in all inputs |
-| Ni | 0.0 | 0.002 | 0.0 | 0.05 – 1.0 | ⚠ Only urine provides Ni |
-| Co | 0.0 | 0.001 | 0.0 | 0.01 – 0.3 | ⚠ Only urine provides Co |
-
-### Metal Dynamics
-
-```
-d(Metal)/dt = -0.0005 · Metal    (first-order decay, ~0.05%/min)
+[00d 01h 30m] t=90
+  CTRL: pH=6.95 EC=7.02 ORP=-186mV T=25.0C V=185mV
+  CTRL_DOSE: urine=0.0mL wine=0.0mL spir=0.8mL
+  EXP:  pH=7.01 EC=6.85 ORP=-195mV T=25.1C V=190mV
+  EXP_DOSE:  urine=0.0mL wine=0.0mL spir=0.8mL
+  STATUS: CTRL=OK EXP=OK
 ```
 
-Metals are mixed via CSTR physics during dosing events, then decay between doses.
+## Summary Table
 
-### Metal Sufficiency Analysis
+At end of simulation, prints:
+- Total power (mWh)
+- Final pH, EC, ORP, voltage vs target ranges
+- Trace metal breakdown (Fe, Mn, Co, Ni, Cu, Zn, Se)
+- Pump engagement count (times activated)
+- Total substrate used (mL)
 
-Based on 8-hour simulation results:
+## Usage
 
-| Metal | Status | Notes |
-|-------|--------|-------|
-| Fe | ✓ OK | Spirulina provides sufficient Fe |
-| Zn | ⚠ Marginal | May drop below target over extended runs |
-| Cu | ✓ OK | Spirulina provides adequate Cu |
-| Mn | ⚠ Marginal | May require supplementation |
-| Se | ✗ Low | All inputs insufficient; consider supplementation |
-| Ni | ✗ Low | Only urine provides Ni; may need supplementation |
-| Co | ✗ Low | Only urine provides Co; may need supplementation |
-
-## Outputs (Monitored)
-
-- MFC voltage
-- ORP (redox potential)
-- Trace metals (Fe, Zn, Cu, Mn, Se, Ni, Co) — estimated via mass balance
-
-## Hardware
-
-- Arduino Giga R1
-- pH sensor (analog, A0)
-- EC sensor (analog, A1)
-- TAN sensor (ISE or colorimetric, A2)
-- 3× 3V submersible pumps (relay-controlled, D0-D2)
-- Status LED (D3)
-
-## Files
-
-| File | Description |
-|------|-------------|
-| `mfc_control_system.ino` | Arduino code with full state-space model and metal tracking |
-| `mfc_simulation.py` | Python simulation matching state-space formulation |
-
-## Simulation Results (8 hours)
-
-```
-Duration: 480 minutes (8.0 hours)
-Final Volume: 2665 mL
-
-Substrate Usage:
-  Wine        :  260 mL (15.6%) - 52 doses
-  Urine       : 1300 mL (78.1%) - 260 doses
-  Spirulina   :  105 mL ( 6.3%) - 21 doses
-  Total       : 1665 mL
-
-Final State:
-  pH:  7.20 (target: 6.8-7.2)   ✓ OK
-  EC:  4.73 mS/cm (target: 5.0-10.0)   ⚠ LOW
-  TAN: 46.8 mg-N/L (target: 50.0-200.0)   ⚠ LOW
-
-Final Trace Metals:
-  Fe: 0.445 mg/L   ✗ LOW
-  Zn: 0.063 mg/L   ✗ LOW
-  Cu: 0.050 mg/L   ✓ OK
-  Mn: 0.043 mg/L   ✗ LOW
-  Se: 0.003 mg/L   ✗ LOW
-  Ni: 0.004 mg/L   ✗ LOW
-  Co: 0.003 mg/L   ✗ LOW
+```bash
+python mfc_simulation.py
 ```
 
-## References
+## Configuration
 
-1. Batstone, D.J. et al. (2002). The IWA Anaerobic Digestion Model No 1 (ADM1). *Water Science & Technology*, 45(10):65-73.
-2. Siegrist, H. et al. (2002). Mathematical model for meso- and thermophilic anaerobic sewage sludge digestion. *Water Science & Technology*, 45(10):93-100.
-3. Udert, K.M. et al. (2006). Fate of nitrogen and phosphorus in source-separated urine. *Water Research*, 40(9):1803-1812.
+Edit these parameters in `run_simulation()`:
+- `duration_minutes`: Simulation length (default 2880 = 2 days)
+- `perturbation_time`: When to add citric acid (default 1440 = day 1)
+- `perturbation_mass`: Grams of citric acid (default 10.0)
+- `print_interval`: Output frequency (default 1 = every minute)
+
+## Physics Equations
+
+- **ORP**: ORP ≈ -200 - 59·(pH - 7) + 5·ln(EC)
+- **Voltage**: Quadratic pH penalty around optimum (7.0)
+- **pH-EC Coupling**: β = κ·EC when ORP > -100 mV AND pH < 6.8
+- **Trace Metal Decay**: First-order kinetics with input additions
 
 ## Author
 
-Jonathan Miller — Boston University
+Jonathan Miller - Master's Thesis
