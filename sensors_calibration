@@ -1,0 +1,182 @@
+#include <math.h>
+
+// Sensor-Only Monitoring System
+// Arduino GIGA R1
+// ======================================================
+
+// ------------ Sensor Pins ------------
+// Tank 1 Sensors
+const int PH_PIN_1   = A0;
+const int ORP_PIN_1  = A1;
+const int EC_PIN_1   = A2;
+const int MFC_PIN_1  = A3;
+const int TEMP_PIN_1 = A7;
+
+// Tank 2 Sensors
+const int EC_PIN_2   = A4;
+const int PH_PIN_2   = A5;
+const int ORP_PIN_2  = A6;
+const int TEMP_PIN_2 = A8;
+const int MFC_PIN_2  = A9;
+
+// ------------ Calibration Constants ------------
+const float VREF = 3.3;
+const int   ADC_MAX = 4095;
+
+const float PH_SLOPE     = -5.59047;
+const float PH_INTERCEPT = 15.835;
+
+const float EC_SLOPE_MSPERMV = 0.00864;
+const float EC_OFFSET_MS     = 0.033;
+
+const float ORP_OFFSET = -1524.0;
+const int ORP_OVERSAMPLES = 50;
+
+// Temperature sensor calibration (adjust for your sensor type)
+// Example for TMP36: Temp(C) = (voltage - 0.5) * 100
+const float TEMP_OFFSET = -0.5;
+const float TEMP_SCALE  = 100.0;
+
+// ------------ Timing Variables ------------
+unsigned long lastSensorRead = 0;
+const unsigned long SENSOR_INTERVAL = 5000; // Read sensors every 5 seconds
+
+// ======================================================
+struct SensorData {
+  // Tank 1
+  float pH_1;
+  float EC_mS_1;
+  float ORP_mV_1;
+  float MFC_mV_1;
+  float Temp_C_1;
+  // Tank 2
+  float pH_2;
+  float EC_mS_2;
+  float ORP_mV_2;
+  float MFC_mV_2;
+  float Temp_C_2;
+};
+
+// ------------ Forward Declarations ------------
+SensorData readSensors();
+void printSensors(const SensorData& data);
+
+// ======================================================
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  Serial.println("Starting Sensor Monitoring System...");
+  Serial.println("Tank 1: pH, EC, ORP, MFC, Temp");
+  Serial.println("Tank 2: pH, EC, ORP, MFC, Temp");
+  Serial.println();
+
+  analogReadResolution(12);
+}
+
+// ======================================================
+void loop() {
+  unsigned long currentTime = millis();
+
+  if (currentTime - lastSensorRead >= SENSOR_INTERVAL) {
+    SensorData data = readSensors();
+    printSensors(data);
+    lastSensorRead = currentTime;
+  }
+}
+
+// ======================================================
+// Helper: Read ORP with oversampling
+// ======================================================
+float readORP(int pin) {
+  long sum = 0;
+  for (int i = 0; i < ORP_OVERSAMPLES; i++) {
+    sum += analogRead(pin);
+    delayMicroseconds(100);
+  }
+  float orp_raw = sum / (float)ORP_OVERSAMPLES;
+  float orp_mV = (orp_raw * VREF / ADC_MAX) * 1000.0;
+  return orp_mV + ORP_OFFSET;
+}
+
+// ======================================================
+// Helper: Read pH
+// ======================================================
+float readPH(int pin) {
+  int ph_raw = analogRead(pin);
+  float ph_voltage = ph_raw * (VREF / ADC_MAX);
+  return PH_SLOPE * ph_voltage + PH_INTERCEPT;
+}
+
+// ======================================================
+// Helper: Read EC
+// ======================================================
+float readEC(int pin) {
+  int ec_raw = analogRead(pin);
+  float ec_mV = (float)ec_raw * 3300.0 / 4095.0;
+  return EC_SLOPE_MSPERMV * ec_mV + EC_OFFSET_MS;
+}
+
+// ======================================================
+// Helper: Read Temperature
+// ======================================================
+float readTemp(int pin) {
+  int temp_raw = analogRead(pin);
+  float voltage = temp_raw * (VREF / ADC_MAX);
+  return (voltage + TEMP_OFFSET) * TEMP_SCALE;
+}
+
+// ======================================================
+// Helper: Read MFC Voltage
+// ======================================================
+float readMFC(int pin) {
+  int mfc_raw = analogRead(pin);
+  return (float)mfc_raw * 3300.0 / 4095.0;
+}
+
+// ======================================================
+// Sensor Reading Function
+// ======================================================
+SensorData readSensors() {
+  SensorData data;
+
+  // Tank 1 Sensors
+  data.pH_1     = readPH(PH_PIN_1);
+  data.EC_mS_1  = readEC(EC_PIN_1);
+  data.ORP_mV_1 = readORP(ORP_PIN_1);
+  data.MFC_mV_1 = readMFC(MFC_PIN_1);
+  data.Temp_C_1 = readTemp(TEMP_PIN_1);
+
+  // Tank 2 Sensors
+  data.pH_2     = readPH(PH_PIN_2);
+  data.EC_mS_2  = readEC(EC_PIN_2);
+  data.ORP_mV_2 = readORP(ORP_PIN_2);
+  data.MFC_mV_2 = readMFC(MFC_PIN_2);
+  data.Temp_C_2 = readTemp(TEMP_PIN_2);
+
+  return data;
+}
+
+// ======================================================
+// Print Sensor Data
+// ======================================================
+void printSensors(const SensorData& data) {
+  Serial.println("========== SENSOR READINGS ==========");
+  
+  Serial.println("--- Tank 1 ---");
+  Serial.print("  pH:     "); Serial.println(data.pH_1, 2);
+  Serial.print("  EC:     "); Serial.print(data.EC_mS_1, 3); Serial.println(" mS/cm");
+  Serial.print("  ORP:    "); Serial.print(data.ORP_mV_1, 1); Serial.println(" mV");
+  Serial.print("  MFC:    "); Serial.print(data.MFC_mV_1, 1); Serial.println(" mV");
+  Serial.print("  Temp:   "); Serial.print(data.Temp_C_1, 1); Serial.println(" C");
+
+  Serial.println("--- Tank 2 ---");
+  Serial.print("  pH:     "); Serial.println(data.pH_2, 2);
+  Serial.print("  EC:     "); Serial.print(data.EC_mS_2, 3); Serial.println(" mS/cm");
+  Serial.print("  ORP:    "); Serial.print(data.ORP_mV_2, 1); Serial.println(" mV");
+  Serial.print("  MFC:    "); Serial.print(data.MFC_mV_2, 1); Serial.println(" mV");
+  Serial.print("  Temp:   "); Serial.print(data.Temp_C_2, 1); Serial.println(" C");
+
+  Serial.println("=====================================");
+  Serial.println();
+}
