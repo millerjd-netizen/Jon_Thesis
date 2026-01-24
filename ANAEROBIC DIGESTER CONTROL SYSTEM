@@ -1,0 +1,445 @@
+/*
+ * ================================================================
+ * ANAEROBIC DIGESTER CONTROL SYSTEM
+ * Arduino GIGA R1
+ * ================================================================
+ * Tank 1 = BASELINE GROUP (Fixed ratios, no control)
+ * Tank 2 = EXPERIMENTAL GROUP (Adaptive control)
+ * ================================================================
+ */
+
+#include <math.h>
+
+// ================================================================
+// PIN DEFINITIONS
+// ================================================================
+
+// ------------ Tank 1 (BASELINE) Sensor Pins ------------
+const int PH_PIN_1   = A0;
+const int ORP_PIN_1  = A1;
+const int EC_PIN_1   = A2;
+const int MFC_PIN_1  = A3;
+const int TEMP_PIN_1 = A7;
+
+// ------------ Tank 2 (EXPERIMENTAL) Sensor Pins ------------
+const int EC_PIN_2   = A4;
+const int PH_PIN_2   = A5;
+const int ORP_PIN_2  = A6;
+const int TEMP_PIN_2 = A8;
+const int MFC_PIN_2  = A9;
+
+// ------------ Pump Relay Pins (Active-High) ------------
+// Tank 1 (BASELINE) Pumps
+const int PUMP_URINE_1    = 2;  // Relay 1: Fermented Urine
+const int PUMP_SPIRFEOX_1 = 3;  // Relay 2: Spirulina + Iron Oxide
+const int PUMP_MOLWINE_1  = 4;  // Relay 3: Molasses + Wine
+
+// Tank 2 (EXPERIMENTAL) Pumps
+const int PUMP_URINE_2    = 5;  // Relay 4: Fermented Urine
+const int PUMP_SPIRFEOX_2 = 6;  // Relay 5: Spirulina + Iron Oxide
+const int PUMP_MOLWINE_2  = 7;  // Relay 6: Molasses + Wine
+
+// ================================================================
+// SENSOR CALIBRATION CONSTANTS
+// ================================================================
+const float VREF = 3.3;
+const int   ADC_MAX = 4095;
+
+const float PH_SLOPE     = -5.59047;
+const float PH_INTERCEPT = 15.835;
+
+const float EC_SLOPE_MSPERMV = 0.00864;
+const float EC_OFFSET_MS     = 0.033;
+
+const float ORP_OFFSET = -1524.0;
+const int ORP_OVERSAMPLES = 50;
+
+const float TEMP_OFFSET = -0.5;
+const float TEMP_SCALE  = 100.0;
+
+// ================================================================
+// PUMP CALIBRATION - ADJUST THESE AFTER CALIBRATION
+// ================================================================
+// mL per second for each pump (measure and update these values)
+const float ML_PER_SEC_URINE_1    = 1.0;  // Tank 1 urine pump
+const float ML_PER_SEC_SPIRFEOX_1 = 1.0;  // Tank 1 spirulina+feox pump
+const float ML_PER_SEC_MOLWINE_1  = 1.0;  // Tank 1 molasses+wine pump
+const float ML_PER_SEC_URINE_2    = 1.0;  // Tank 2 urine pump
+const float ML_PER_SEC_SPIRFEOX_2 = 1.0;  // Tank 2 spirulina+feox pump
+const float ML_PER_SEC_MOLWINE_2  = 1.0;  // Tank 2 molasses+wine pump
+
+// ================================================================
+// REACTOR CONFIGURATION
+// ================================================================
+const float REACTOR_VOLUME_L = 1.0;       // Liters
+const float BASE_HRT = 24.0;              // hours (normal operation)
+const float EMERGENCY_HRT = 3.0;          // hours (pH out of range - EXPERIMENTAL only)
+const unsigned long DOSE_INTERVAL_MS = 60000;  // 1 minute between doses
+
+// ================================================================
+// TARGET RANGES
+// ================================================================
+const float PH_MIN = 6.5;
+const float PH_MAX = 7.5;
+const float PH_TARGET = 7.0;
+const float FEOX_TARGET = 3.0;
+
+// ================================================================
+// BASELINE GROUP - FIXED RATIOS
+// ================================================================
+const float BASELINE_FRAC_URINE = 0.11;     // 11%
+const float BASELINE_FRAC_SPIRFEOX = 0.32;  // 32%
+const float BASELINE_FRAC_MOLWINE = 0.57;   // 57%
+
+// ================================================================
+// INPUT STREAM PROPERTIES (for EXPERIMENTAL adaptive control)
+// ================================================================
+// pH values
+const float URINE_PH = 9.1;
+const float SPIRULINA_PH = 8.24;
+const float FEOX_PH = 7.0;
+const float MOLASSES_PH = 5.5;
+const float WINE_PH = 3.4;
+
+// Buffer capacities (meq/L)
+const float URINE_BUFFER = 490.0;
+const float SPIRULINA_BUFFER = 10.0;
+const float FEOX_BUFFER = 5.0;
+const float MOLASSES_BUFFER = 75.0;
+const float WINE_BUFFER = 80.0;
+
+// Pre-calculated mixed stream properties
+const float SPIRFEOX_PH = (SPIRULINA_PH * SPIRULINA_BUFFER + FEOX_PH * FEOX_BUFFER) / (SPIRULINA_BUFFER + FEOX_BUFFER);
+const float SPIRFEOX_BUFFER = SPIRULINA_BUFFER + FEOX_BUFFER;
+const float MOLWINE_PH = (MOLASSES_PH * MOLASSES_BUFFER + WINE_PH * WINE_BUFFER) / (MOLASSES_BUFFER + WINE_BUFFER);
+const float MOLWINE_BUFFER = (MOLASSES_BUFFER + WINE_BUFFER) / 2.0;
+
+// ================================================================
+// DATA STRUCTURES
+// ================================================================
+struct SensorData {
+  float pH;
+  float EC_mS;
+  float ORP_mV;
+  float MFC_mV;
+  float Temp_C;
+};
+
+struct DoseVolumes {
+  float Q_urine_mL;
+  float Q_spirfeox_mL;
+  float Q_molwine_mL;
+  float Q_total_mL;
+  float HRT;
+};
+
+// ================================================================
+// GLOBAL STATE
+// ================================================================
+unsigned long lastDoseTime = 0;
+unsigned long doseCount = 0;
+float elapsedHours = 0.0;
+
+// ================================================================
+// SENSOR READING FUNCTIONS
+// ================================================================
+
+float readORP(int pin) {
+  long sum = 0;
+  for (int i = 0; i < ORP_OVERSAMPLES; i++) {
+    sum += analogRead(pin);
+    delayMicroseconds(100);
+  }
+  float orp_raw = sum / (float)ORP_OVERSAMPLES;
+  float orp_mV = (orp_raw * VREF / ADC_MAX) * 1000.0;
+  return orp_mV + ORP_OFFSET;
+}
+
+float readPH(int pin) {
+  int ph_raw = analogRead(pin);
+  float ph_voltage = ph_raw * (VREF / ADC_MAX);
+  return PH_SLOPE * ph_voltage + PH_INTERCEPT;
+}
+
+float readEC(int pin) {
+  int ec_raw = analogRead(pin);
+  float ec_mV = (float)ec_raw * 3300.0 / 4095.0;
+  return EC_SLOPE_MSPERMV * ec_mV + EC_OFFSET_MS;
+}
+
+float readTemp(int pin) {
+  int temp_raw = analogRead(pin);
+  float voltage = temp_raw * (VREF / ADC_MAX);
+  return (voltage + TEMP_OFFSET) * TEMP_SCALE;
+}
+
+float readMFC(int pin) {
+  int mfc_raw = analogRead(pin);
+  return (float)mfc_raw * 3300.0 / 4095.0;
+}
+
+SensorData readTank1Sensors() {
+  SensorData data;
+  data.pH     = readPH(PH_PIN_1);
+  data.EC_mS  = readEC(EC_PIN_1);
+  data.ORP_mV = readORP(ORP_PIN_1);
+  data.MFC_mV = readMFC(MFC_PIN_1);
+  data.Temp_C = readTemp(TEMP_PIN_1);
+  return data;
+}
+
+SensorData readTank2Sensors() {
+  SensorData data;
+  data.pH     = readPH(PH_PIN_2);
+  data.EC_mS  = readEC(EC_PIN_2);
+  data.ORP_mV = readORP(ORP_PIN_2);
+  data.MFC_mV = readMFC(MFC_PIN_2);
+  data.Temp_C = readTemp(TEMP_PIN_2);
+  return data;
+}
+
+// ================================================================
+// BASELINE CONTROL (Tank 1) - Fixed Ratios
+// ================================================================
+
+DoseVolumes calculateBaselineDose() {
+  DoseVolumes dose;
+  dose.HRT = BASE_HRT;  // Always 24 hours
+  
+  // Total flow per dose: (Volume_mL) / (HRT_hours * 60 min/hr)
+  dose.Q_total_mL = (REACTOR_VOLUME_L * 1000.0) / (dose.HRT * 60.0);
+  
+  // Fixed ratios
+  dose.Q_urine_mL   = dose.Q_total_mL * BASELINE_FRAC_URINE;
+  dose.Q_spirfeox_mL = dose.Q_total_mL * BASELINE_FRAC_SPIRFEOX;
+  dose.Q_molwine_mL = dose.Q_total_mL * BASELINE_FRAC_MOLWINE;
+  
+  return dose;
+}
+
+// ================================================================
+// EXPERIMENTAL CONTROL (Tank 2) - Adaptive
+// ================================================================
+
+DoseVolumes calculateExperimentalDose(const SensorData& sensors) {
+  DoseVolumes dose;
+  
+  // Determine HRT based on pH
+  if (sensors.pH < PH_MIN || sensors.pH > PH_MAX) {
+    dose.HRT = EMERGENCY_HRT;  // 3 hours - aggressive correction
+  } else {
+    dose.HRT = BASE_HRT;  // 24 hours - normal operation
+  }
+  
+  // Total flow per dose
+  dose.Q_total_mL = (REACTOR_VOLUME_L * 1000.0) / (dose.HRT * 60.0);
+  
+  // Start with optimized base fractions (pre-calculated from grid search)
+  // These target pH=7.0 and FeOx=3.0
+  float f_urine = 0.15;
+  float f_spirfeox = 0.30;
+  float f_molwine = 0.55;
+  
+  // ADAPTIVE CORRECTION based on pH error
+  float pH_error = sensors.pH - PH_TARGET;
+  
+  if (fabs(pH_error) > 0.3) {
+    if (pH_error > 0) {
+      // Too alkaline - increase acidic molasses+wine, decrease alkaline urine
+      f_molwine = min(0.8, f_molwine + 0.3);
+      f_urine = max(0.05, f_urine - 0.2);
+    } else {
+      // Too acidic - increase alkaline urine, decrease acidic molasses+wine
+      f_urine = min(0.8, f_urine + 0.3);
+      f_molwine = max(0.05, f_molwine - 0.2);
+    }
+  }
+  
+  // Note: FeOx correction would require tracking FeOx state
+  // For now, we rely on pH-based correction
+  
+  // Normalize fractions
+  float total_frac = f_urine + f_spirfeox + f_molwine;
+  f_urine /= total_frac;
+  f_spirfeox /= total_frac;
+  f_molwine /= total_frac;
+  
+  // Calculate volumes
+  dose.Q_urine_mL = dose.Q_total_mL * f_urine;
+  dose.Q_spirfeox_mL = dose.Q_total_mL * f_spirfeox;
+  dose.Q_molwine_mL = dose.Q_total_mL * f_molwine;
+  
+  return dose;
+}
+
+// ================================================================
+// PUMP CONTROL FUNCTIONS
+// ================================================================
+
+void allPumpsOff() {
+  digitalWrite(PUMP_URINE_1, LOW);
+  digitalWrite(PUMP_SPIRFEOX_1, LOW);
+  digitalWrite(PUMP_MOLWINE_1, LOW);
+  digitalWrite(PUMP_URINE_2, LOW);
+  digitalWrite(PUMP_SPIRFEOX_2, LOW);
+  digitalWrite(PUMP_MOLWINE_2, LOW);
+}
+
+void runPump(int pin, float mL, float mL_per_sec) {
+  if (mL <= 0) return;
+  
+  unsigned long run_time_ms = (unsigned long)((mL / mL_per_sec) * 1000.0);
+  
+  digitalWrite(pin, HIGH);
+  delay(run_time_ms);
+  digitalWrite(pin, LOW);
+  delay(100);  // Brief pause between pumps
+}
+
+void executeDose_Tank1(const DoseVolumes& dose) {
+  // Run pumps sequentially for Tank 1 (BASELINE)
+  runPump(PUMP_URINE_1, dose.Q_urine_mL, ML_PER_SEC_URINE_1);
+  runPump(PUMP_SPIRFEOX_1, dose.Q_spirfeox_mL, ML_PER_SEC_SPIRFEOX_1);
+  runPump(PUMP_MOLWINE_1, dose.Q_molwine_mL, ML_PER_SEC_MOLWINE_1);
+}
+
+void executeDose_Tank2(const DoseVolumes& dose) {
+  // Run pumps sequentially for Tank 2 (EXPERIMENTAL)
+  runPump(PUMP_URINE_2, dose.Q_urine_mL, ML_PER_SEC_URINE_2);
+  runPump(PUMP_SPIRFEOX_2, dose.Q_spirfeox_mL, ML_PER_SEC_SPIRFEOX_2);
+  runPump(PUMP_MOLWINE_2, dose.Q_molwine_mL, ML_PER_SEC_MOLWINE_2);
+}
+
+// ================================================================
+// OUTPUT FUNCTIONS
+// ================================================================
+
+void printHeader() {
+  Serial.println(F("================================================================================================================================================"));
+  Serial.println(F("ANAEROBIC DIGESTER DUAL-TANK CONTROL SYSTEM"));
+  Serial.println(F("Tank 1 = BASELINE (Fixed Ratios) | Tank 2 = EXPERIMENTAL (Adaptive Control)"));
+  Serial.println(F("================================================================================================================================================"));
+  Serial.println(F("Time(hr) | Tank | Phase          | Q_urine | Q_sp+fe | Q_mw    | pH     | EC     | ORP      | MFC    | Temp  | HRT"));
+  Serial.println(F("         |      |                | (mL)    | (mL)    | (mL)    |        | mS/cm  | (mV)     | (mV)   | (C)   | (hr)"));
+  Serial.println(F("------------------------------------------------------------------------------------------------------------------------------------------------"));
+}
+
+void printTankData(float time_hr, int tank, const char* phase, 
+                   const DoseVolumes& dose, const SensorData& sensors) {
+  char buffer[200];
+  
+  sprintf(buffer, "%8.2f | T%d   | %-14s | %7.3f | %7.3f | %7.3f | %6.2f | %6.2f | %8.1f | %6.1f | %5.1f | %5.1f",
+          time_hr, tank, phase,
+          dose.Q_urine_mL, dose.Q_spirfeox_mL, dose.Q_molwine_mL,
+          sensors.pH, sensors.EC_mS, sensors.ORP_mV, sensors.MFC_mV, 
+          sensors.Temp_C, dose.HRT);
+  
+  Serial.println(buffer);
+}
+
+const char* getPhase_Baseline(float pH) {
+  if (pH < PH_MIN) return "pH_LOW";
+  if (pH > PH_MAX) return "pH_HIGH";
+  return "normal";
+}
+
+const char* getPhase_Experimental(float pH) {
+  if (pH < PH_MIN) return "pH_LOW_CORR";
+  if (pH > PH_MAX) return "pH_HIGH_CORR";
+  return "normal";
+}
+
+// ================================================================
+// SETUP
+// ================================================================
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+  delay(1000);
+  
+  // Initialize pump pins
+  pinMode(PUMP_URINE_1, OUTPUT);
+  pinMode(PUMP_SPIRFEOX_1, OUTPUT);
+  pinMode(PUMP_MOLWINE_1, OUTPUT);
+  pinMode(PUMP_URINE_2, OUTPUT);
+  pinMode(PUMP_SPIRFEOX_2, OUTPUT);
+  pinMode(PUMP_MOLWINE_2, OUTPUT);
+  
+  // Ensure all pumps are OFF
+  allPumpsOff();
+  
+  // Set ADC resolution
+  analogReadResolution(12);
+  
+  // Print startup info
+  Serial.println(F(""));
+  Serial.println(F("================================================================"));
+  Serial.println(F("  ANAEROBIC DIGESTER CONTROL SYSTEM - STARTING"));
+  Serial.println(F("================================================================"));
+  Serial.println(F(""));
+  Serial.println(F("PUMP CALIBRATION VALUES (mL/sec):"));
+  Serial.print(F("  Tank 1 Urine:      ")); Serial.println(ML_PER_SEC_URINE_1);
+  Serial.print(F("  Tank 1 Spir+FeOx:  ")); Serial.println(ML_PER_SEC_SPIRFEOX_1);
+  Serial.print(F("  Tank 1 Mol+Wine:   ")); Serial.println(ML_PER_SEC_MOLWINE_1);
+  Serial.print(F("  Tank 2 Urine:      ")); Serial.println(ML_PER_SEC_URINE_2);
+  Serial.print(F("  Tank 2 Spir+FeOx:  ")); Serial.println(ML_PER_SEC_SPIRFEOX_2);
+  Serial.print(F("  Tank 2 Mol+Wine:   ")); Serial.println(ML_PER_SEC_MOLWINE_2);
+  Serial.println(F(""));
+  Serial.println(F("BASELINE FIXED RATIOS:"));
+  Serial.print(F("  Urine:      ")); Serial.print(BASELINE_FRAC_URINE * 100); Serial.println(F("%"));
+  Serial.print(F("  Spir+FeOx:  ")); Serial.print(BASELINE_FRAC_SPIRFEOX * 100); Serial.println(F("%"));
+  Serial.print(F("  Mol+Wine:   ")); Serial.print(BASELINE_FRAC_MOLWINE * 100); Serial.println(F("%"));
+  Serial.println(F(""));
+  Serial.print(F("Dose interval: ")); Serial.print(DOSE_INTERVAL_MS / 1000); Serial.println(F(" seconds"));
+  Serial.print(F("Base HRT: ")); Serial.print(BASE_HRT); Serial.println(F(" hours"));
+  Serial.print(F("Emergency HRT (Experimental only): ")); Serial.print(EMERGENCY_HRT); Serial.println(F(" hours"));
+  Serial.println(F(""));
+  
+  printHeader();
+  
+  lastDoseTime = millis();
+}
+
+// ================================================================
+// MAIN LOOP
+// ================================================================
+
+void loop() {
+  unsigned long currentTime = millis();
+  
+  if (currentTime - lastDoseTime >= DOSE_INTERVAL_MS) {
+    // Update elapsed time
+    elapsedHours = (doseCount * DOSE_INTERVAL_MS) / 3600000.0;
+    
+    // ============ TANK 1: BASELINE ============
+    SensorData sensors1 = readTank1Sensors();
+    DoseVolumes dose1 = calculateBaselineDose();
+    const char* phase1 = getPhase_Baseline(sensors1.pH);
+    
+    // Print Tank 1 data
+    printTankData(elapsedHours, 1, phase1, dose1, sensors1);
+    
+    // Execute Tank 1 dose
+    executeDose_Tank1(dose1);
+    
+    // ============ TANK 2: EXPERIMENTAL ============
+    SensorData sensors2 = readTank2Sensors();
+    DoseVolumes dose2 = calculateExperimentalDose(sensors2);
+    const char* phase2 = getPhase_Experimental(sensors2.pH);
+    
+    // Print Tank 2 data
+    printTankData(elapsedHours, 2, phase2, dose2, sensors2);
+    
+    // Execute Tank 2 dose
+    executeDose_Tank2(dose2);
+    
+    // Separator line every 10 doses
+    doseCount++;
+    if (doseCount % 10 == 0) {
+      Serial.println(F("------------------------------------------------------------------------------------------------------------------------------------------------"));
+    }
+    
+    lastDoseTime = currentTime;
+  }
+}
