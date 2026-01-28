@@ -6,12 +6,19 @@
  * Tank 1 = BASELINE GROUP (Fixed ratios, no control)
  * Tank 2 = EXPERIMENTAL GROUP (Adaptive control)
  * ================================================================
+ * DS18B20 Temperature Sensors
+ * --------------------------
+ * Tank 1 Temp -> D10 + 4.7k pullup to 5V
+ * Tank 2 Temp -> D11 + 4.7k pullup to 5V
+ * ================================================================
  * Outputs CSV lines prefixed with "DATA," for computer logging
  * Run digester_logger.py on computer to save hourly CSV files
  * ================================================================
  */
 
 #include <math.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
 
 // ================================================================
 // PIN DEFINITIONS
@@ -22,14 +29,22 @@ const int PH_PIN_1   = A0;
 const int ORP_PIN_1  = A1;
 const int EC_PIN_1   = A2;
 const int MFC_PIN_1  = A3;
-const int TEMP_PIN_1 = A7;
 
 // ------------ Tank 2 (EXPERIMENTAL) Sensor Pins ------------
 const int EC_PIN_2   = A4;
 const int PH_PIN_2   = A5;
 const int ORP_PIN_2  = A6;
-const int TEMP_PIN_2 = A8;
-const int MFC_PIN_2  = A9;
+#define MFC_PIN_2 A9  // Pure analog pin
+
+// ------------ DS18B20 Temperature Pins (Digital) ------------
+#define TEMP_PIN_1 10
+#define TEMP_PIN_2 11
+
+// ------------ OneWire Buses ------------
+OneWire oneWire1(TEMP_PIN_1);
+DallasTemperature tempBus1(&oneWire1);
+OneWire oneWire2(TEMP_PIN_2);
+DallasTemperature tempBus2(&oneWire2);
 
 // ------------ Pump Relay Pins (Active-High) ------------
 const int PUMP_URINE_1    = 2;
@@ -42,16 +57,14 @@ const int PUMP_MOLWINE_2  = 7;
 // ================================================================
 // SENSOR CALIBRATION CONSTANTS
 // ================================================================
-const float VREF = 3.3;
+const float VREF = 3.3f;
 const int   ADC_MAX = 4095;
-const float PH_SLOPE     = -5.59047;
-const float PH_INTERCEPT = 15.835;
-const float EC_SLOPE_MSPERMV = 0.00864;
-const float EC_OFFSET_MS     = 0.033;
-const float ORP_OFFSET = -1524.0;
+const float PH_SLOPE     = -5.59047f;
+const float PH_INTERCEPT = 15.835f;
+const float EC_SLOPE_MSPERMV = 0.00864f;
+const float EC_OFFSET_MS     = 0.033f;
+const float ORP_OFFSET = -1524.0f;
 const int ORP_OVERSAMPLES = 50;
-const float TEMP_OFFSET = -0.5;
-const float TEMP_SCALE  = 100.0;
 
 // ================================================================
 // PUMP CALIBRATION - ADJUST AFTER CALIBRATION
@@ -112,6 +125,22 @@ unsigned long doseCount = 0;
 float elapsedHours = 0.0;
 
 // ================================================================
+// HELPER FUNCTIONS
+// ================================================================
+
+float rawTo_mV(int raw) {
+  return raw * 3300.0f / 4095.0f;
+}
+
+float readDS18B20(DallasTemperature& bus) {
+  bus.requestTemperatures();
+  float c = bus.getTempCByIndex(0);
+  if (c == DEVICE_DISCONNECTED_C || c == 85.0f) return NAN;
+  if (c < -55.0f || c > 125.0f) return NAN;
+  return c;
+}
+
+// ================================================================
 // SENSOR READING FUNCTIONS
 // ================================================================
 
@@ -121,32 +150,21 @@ float readORP(int pin) {
     sum += analogRead(pin);
     delayMicroseconds(100);
   }
-  float orp_raw = sum / (float)ORP_OVERSAMPLES;
-  float orp_mV = (orp_raw * VREF / ADC_MAX) * 1000.0;
-  return orp_mV + ORP_OFFSET;
+  float avg = sum / (float)ORP_OVERSAMPLES;
+  return (avg * VREF / ADC_MAX) * 1000.0f + ORP_OFFSET;
 }
 
 float readPH(int pin) {
-  int ph_raw = analogRead(pin);
-  float ph_voltage = ph_raw * (VREF / ADC_MAX);
-  return PH_SLOPE * ph_voltage + PH_INTERCEPT;
+  float v = analogRead(pin) * (VREF / ADC_MAX);
+  return PH_SLOPE * v + PH_INTERCEPT;
 }
 
 float readEC(int pin) {
-  int ec_raw = analogRead(pin);
-  float ec_mV = (float)ec_raw * 3300.0 / 4095.0;
-  return EC_SLOPE_MSPERMV * ec_mV + EC_OFFSET_MS;
-}
-
-float readTemp(int pin) {
-  int temp_raw = analogRead(pin);
-  float voltage = temp_raw * (VREF / ADC_MAX);
-  return (voltage + TEMP_OFFSET) * TEMP_SCALE;
+  return EC_SLOPE_MSPERMV * rawTo_mV(analogRead(pin)) + EC_OFFSET_MS;
 }
 
 float readMFC(int pin) {
-  int mfc_raw = analogRead(pin);
-  return (float)mfc_raw * 3300.0 / 4095.0;
+  return rawTo_mV(analogRead(pin));
 }
 
 SensorData readTank1Sensors() {
@@ -155,7 +173,7 @@ SensorData readTank1Sensors() {
   data.EC_mS  = readEC(EC_PIN_1);
   data.ORP_mV = readORP(ORP_PIN_1);
   data.MFC_mV = readMFC(MFC_PIN_1);
-  data.Temp_C = readTemp(TEMP_PIN_1);
+  data.Temp_C = readDS18B20(tempBus1);
   return data;
 }
 
@@ -164,8 +182,8 @@ SensorData readTank2Sensors() {
   data.pH     = readPH(PH_PIN_2);
   data.EC_mS  = readEC(EC_PIN_2);
   data.ORP_mV = readORP(ORP_PIN_2);
-  data.MFC_mV = readMFC(MFC_PIN_2);
-  data.Temp_C = readTemp(TEMP_PIN_2);
+  data.MFC_mV = rawTo_mV(analogRead(MFC_PIN_2));
+  data.Temp_C = readDS18B20(tempBus2);
   return data;
 }
 
@@ -235,9 +253,20 @@ void allPumpsOff() {
   digitalWrite(PUMP_MOLWINE_2, LOW);
 }
 
-void runPump(int pin, float mL, float mL_per_sec) {
+void runPump(int pin, float mL, float mL_per_sec, const char* pumpName, int tank) {
   if (mL <= 0) return;
   unsigned long run_time_ms = (unsigned long)((mL / mL_per_sec) * 1000.0);
+  
+  Serial.print("  DOSING T");
+  Serial.print(tank);
+  Serial.print(" ");
+  Serial.print(pumpName);
+  Serial.print(": ");
+  Serial.print(mL, 3);
+  Serial.print(" mL (");
+  Serial.print(run_time_ms);
+  Serial.println(" ms)");
+  
   digitalWrite(pin, HIGH);
   delay(run_time_ms);
   digitalWrite(pin, LOW);
@@ -245,15 +274,19 @@ void runPump(int pin, float mL, float mL_per_sec) {
 }
 
 void executeDose_Tank1(const DoseVolumes& dose) {
-  runPump(PUMP_URINE_1, dose.Q_urine_mL, ML_PER_SEC_URINE_1);
-  runPump(PUMP_SPIRFEOX_1, dose.Q_spirfeox_mL, ML_PER_SEC_SPIRFEOX_1);
-  runPump(PUMP_MOLWINE_1, dose.Q_molwine_mL, ML_PER_SEC_MOLWINE_1);
+  Serial.println("--- TANK 1 DOSING ---");
+  runPump(PUMP_URINE_1, dose.Q_urine_mL, ML_PER_SEC_URINE_1, "URINE", 1);
+  runPump(PUMP_SPIRFEOX_1, dose.Q_spirfeox_mL, ML_PER_SEC_SPIRFEOX_1, "SPIRFEOX", 1);
+  runPump(PUMP_MOLWINE_1, dose.Q_molwine_mL, ML_PER_SEC_MOLWINE_1, "MOLWINE", 1);
+  Serial.println("--- TANK 1 DONE ---");
 }
 
 void executeDose_Tank2(const DoseVolumes& dose) {
-  runPump(PUMP_URINE_2, dose.Q_urine_mL, ML_PER_SEC_URINE_2);
-  runPump(PUMP_SPIRFEOX_2, dose.Q_spirfeox_mL, ML_PER_SEC_SPIRFEOX_2);
-  runPump(PUMP_MOLWINE_2, dose.Q_molwine_mL, ML_PER_SEC_MOLWINE_2);
+  Serial.println("--- TANK 2 DOSING ---");
+  runPump(PUMP_URINE_2, dose.Q_urine_mL, ML_PER_SEC_URINE_2, "URINE", 2);
+  runPump(PUMP_SPIRFEOX_2, dose.Q_spirfeox_mL, ML_PER_SEC_SPIRFEOX_2, "SPIRFEOX", 2);
+  runPump(PUMP_MOLWINE_2, dose.Q_molwine_mL, ML_PER_SEC_MOLWINE_2, "MOLWINE", 2);
+  Serial.println("--- TANK 2 DONE ---");
 }
 
 // ================================================================
@@ -277,24 +310,52 @@ void printHeader() {
   Serial.println(F("ANAEROBIC DIGESTER DUAL-TANK CONTROL SYSTEM"));
   Serial.println(F("Tank 1 = BASELINE (Fixed Ratios) | Tank 2 = EXPERIMENTAL (Adaptive Control)"));
   Serial.println(F("================================================================================================================================================"));
-  Serial.println(F("Time(hr) | Tank | Phase          | Q_urine | Q_sp+fe | Q_mw    | pH     | EC     | ORP      | MFC    | Temp  | HRT"));
-  Serial.println(F("         |      |                | (mL)    | (mL)    | (mL)    |        | mS/cm  | (mV)     | (mV)   | (C)   | (hr)"));
-  Serial.println(F("------------------------------------------------------------------------------------------------------------------------------------------------"));
 }
 
 void printTankData(float time_hr, int tank, const char* group, const char* phase, 
                    const DoseVolumes& dose, const SensorData& sensors) {
-  char buffer[200];
   
-  // Human-readable output
-  sprintf(buffer, "%8.2f | T%d   | %-14s | %7.3f | %7.3f | %7.3f | %6.2f | %6.2f | %8.1f | %6.1f | %5.1f | %5.1f",
-          time_hr, tank, phase,
-          dose.Q_urine_mL, dose.Q_spirfeox_mL, dose.Q_molwine_mL,
-          sensors.pH, sensors.EC_mS, sensors.ORP_mV, sensors.MFC_mV, 
-          sensors.Temp_C, dose.HRT);
-  Serial.println(buffer);
+  Serial.println(F(""));
+  Serial.print(F("=== TANK "));
+  Serial.print(tank);
+  Serial.print(F(" ("));
+  Serial.print(group);
+  Serial.print(F(") === Time: "));
+  Serial.print(time_hr, 2);
+  Serial.print(F(" hr | Phase: "));
+  Serial.println(phase);
   
-  // CSV output line (prefixed with "DATA," for Python logger to capture)
+  Serial.println(F("SENSORS:"));
+  Serial.print(F("  pH="));
+  Serial.print(sensors.pH, 2);
+  Serial.print(F("  EC="));
+  Serial.print(sensors.EC_mS, 3);
+  Serial.print(F(" mS/cm  ORP="));
+  Serial.print(sensors.ORP_mV, 1);
+  Serial.print(F(" mV  MFC="));
+  Serial.print(sensors.MFC_mV, 1);
+  Serial.print(F(" mV  Temp="));
+  if (isnan(sensors.Temp_C)) {
+    Serial.println(F("NA"));
+  } else {
+    Serial.print(sensors.Temp_C, 2);
+    Serial.println(F(" C"));
+  }
+  
+  Serial.println(F("DOSE PLAN:"));
+  Serial.print(F("  URINE="));
+  Serial.print(dose.Q_urine_mL, 3);
+  Serial.print(F(" mL  SPIRFEOX="));
+  Serial.print(dose.Q_spirfeox_mL, 3);
+  Serial.print(F(" mL  MOLWINE="));
+  Serial.print(dose.Q_molwine_mL, 3);
+  Serial.print(F(" mL  TOTAL="));
+  Serial.print(dose.Q_total_mL, 3);
+  Serial.print(F(" mL  HRT="));
+  Serial.print(dose.HRT, 1);
+  Serial.println(F(" hr"));
+  
+  // CSV output line for Python logger
   Serial.print(F("DATA,"));
   Serial.print(time_hr, 4); Serial.print(F(","));
   Serial.print(tank); Serial.print(F(","));
@@ -308,7 +369,12 @@ void printTankData(float time_hr, int tank, const char* group, const char* phase
   Serial.print(sensors.EC_mS, 3); Serial.print(F(","));
   Serial.print(sensors.ORP_mV, 2); Serial.print(F(","));
   Serial.print(sensors.MFC_mV, 2); Serial.print(F(","));
-  Serial.print(sensors.Temp_C, 2); Serial.print(F(","));
+  if (isnan(sensors.Temp_C)) {
+    Serial.print(F("NA"));
+  } else {
+    Serial.print(sensors.Temp_C, 2);
+  }
+  Serial.print(F(","));
   Serial.println(dose.HRT, 1);
 }
 
@@ -331,6 +397,14 @@ void setup() {
   allPumpsOff();
   analogReadResolution(12);
   
+  // Initialize DS18B20 temperature sensors
+  tempBus1.begin();
+  tempBus2.begin();
+  tempBus1.setWaitForConversion(true);
+  tempBus2.setWaitForConversion(true);
+  tempBus1.setResolution(12);
+  tempBus2.setResolution(12);
+  
   Serial.println(F(""));
   Serial.println(F("================================================================"));
   Serial.println(F("  ANAEROBIC DIGESTER CONTROL SYSTEM - STARTING"));
@@ -338,7 +412,12 @@ void setup() {
   Serial.println(F("================================================================"));
   Serial.println(F(""));
   
-  // Output CSV header line for Python logger
+  Serial.print(F("DS18B20 on D10 (Tank 1): "));
+  Serial.println(tempBus1.getDeviceCount());
+  Serial.print(F("DS18B20 on D11 (Tank 2): "));
+  Serial.println(tempBus2.getDeviceCount());
+  Serial.println(F(""));
+  
   Serial.println(F("CSVHEADER,Time_hr,Tank,Group,Phase,Q_urine_mL,Q_spirfeox_mL,Q_molwine_mL,Q_total_mL,pH,EC_mS,ORP_mV,MFC_mV,Temp_C,HRT_hr"));
   
   printHeader();
@@ -355,7 +434,6 @@ void loop() {
   if (currentTime - lastDoseTime >= DOSE_INTERVAL_MS) {
     elapsedHours = (doseCount * DOSE_INTERVAL_MS) / 3600000.0;
     
-    // ============ TANK 1: BASELINE ============
     SensorData sensors1 = readTank1Sensors();
     DoseVolumes dose1 = calculateBaselineDose();
     const char* phase1 = getPhase_Baseline(sensors1.pH);
@@ -363,7 +441,6 @@ void loop() {
     printTankData(elapsedHours, 1, "BASELINE", phase1, dose1, sensors1);
     executeDose_Tank1(dose1);
     
-    // ============ TANK 2: EXPERIMENTAL ============
     SensorData sensors2 = readTank2Sensors();
     DoseVolumes dose2 = calculateExperimentalDose(sensors2);
     const char* phase2 = getPhase_Experimental(sensors2.pH);
@@ -372,9 +449,7 @@ void loop() {
     executeDose_Tank2(dose2);
     
     doseCount++;
-    if (doseCount % 10 == 0) {
-      Serial.println(F("------------------------------------------------------------------------------------------------------------------------------------------------"));
-    }
+    Serial.println(F("================================================================================"));
     
     lastDoseTime = currentTime;
   }
