@@ -1,54 +1,93 @@
+/*
+======================================================
+Combined Sensor Monitoring + Relay Sequencer System
+Arduino GIGA R1
+======================================================
+
+DS18B20 Temperature Sensors
+--------------------------
+Tank 1 Temp -> D10 + 4.7k pullup to 5V
+Tank 2 Temp -> D11 + 4.7k pullup to 5V
+
+NOTES:
+• DS18B20 is DIGITAL (never analogRead)
+• A9 is PURE ANALOG on GIGA → read inline
+======================================================
+*/
+
 #include <math.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
 
 // ======================================================
-// Combined Sensor Monitoring + Relay Sequencer System
-// Arduino GIGA R1
-// ======================================================
+// ------------------- Sensor Pins ----------------------
 
-// ------------ Sensor Pins ------------
-// Tank 1 Sensors
+// Tank 1 (analog)
 const int PH_PIN_1   = A0;
 const int ORP_PIN_1  = A1;
 const int EC_PIN_1   = A2;
 const int MFC_PIN_1  = A3;
-const int TEMP_PIN_1 = A7;
 
-// Tank 2 Sensors
+// Tank 2 (analog)
 const int EC_PIN_2   = A4;
 const int PH_PIN_2   = A5;
 const int ORP_PIN_2  = A6;
-// A8 and A9 are pure analog pins - must use directly with analogRead()
 
-// ------------ Relay Pins (Active-High) ------------
+// Tank 2 MFC (pure analog)
+#define MFC_PIN_2 A9
+
+// DS18B20 temperature (digital)
+#define TEMP_PIN_1 10
+#define TEMP_PIN_2 11
+
+// ======================================================
+// ------------------ OneWire Buses ---------------------
+OneWire oneWire1(TEMP_PIN_1);
+DallasTemperature tempBus1(&oneWire1);
+
+OneWire oneWire2(TEMP_PIN_2);
+DallasTemperature tempBus2(&oneWire2);
+
+// ======================================================
+// ------------------- Relays ---------------------------
 const int RELAY_1 = 2;
 const int RELAY_2 = 3;
 const int RELAY_3 = 4;
 const int RELAY_4 = 5;
 const int RELAY_5 = 6;
 const int RELAY_6 = 7;
+
 const int relays[] = { RELAY_1, RELAY_2, RELAY_3, RELAY_4, RELAY_5, RELAY_6 };
 const int RELAY_COUNT = 6;
 
-// ------------ Calibration Constants ------------
-const float VREF = 3.3;
+// ======================================================
+// ---------------- Pump Names --------------------------
+// Printed directly — one-to-one with relay index
+const char* PUMP_NAME[] = {
+  "Right – Molasses + Wine",     // Relay 0
+  "Right – Molasses + Wine",     // Relay 1
+  "Middle – Spirulina + Fe",     // Relay 2
+  "Left – Urine",                // Relay 3
+  "Middle – Spirulina + Fe",     // Relay 4
+  "Left – Urine"                 // Relay 5
+};
+
+// ======================================================
+// ---------------- Calibration -------------------------
+const float VREF = 3.3f;
 const int   ADC_MAX = 4095;
 
-const float PH_SLOPE     = -5.59047;
-const float PH_INTERCEPT = 15.835;
+const float PH_SLOPE     = -5.59047f;
+const float PH_INTERCEPT = 15.835f;
 
-const float EC_SLOPE_MSPERMV = 0.00864;
-const float EC_OFFSET_MS     = 0.033;
+const float EC_SLOPE_MSPERMV = 0.00864f;
+const float EC_OFFSET_MS     = 0.033f;
 
-const float ORP_OFFSET = -1524.0;
+const float ORP_OFFSET = -1524.0f;
 const int ORP_OVERSAMPLES = 50;
 
-const float TEMP_OFFSET = -0.5;
-const float TEMP_SCALE  = 100.0;
-
-// ------------ Timing Variables ------------
-unsigned long lastSensorRead = 0;
-const unsigned long SENSOR_INTERVAL = 5000;
-
+// ======================================================
+// ----------------- Timing -----------------------------
 unsigned long lastRelayChange = 0;
 const unsigned long RELAY_ON_TIME  = 2000;
 const unsigned long RELAY_OFF_TIME = 500;
@@ -57,33 +96,27 @@ bool relayIsOn = false;
 
 // ======================================================
 struct SensorData {
-  float pH_1;
-  float EC_mS_1;
-  float ORP_mV_1;
-  float MFC_mV_1;
-  float Temp_C_1;
-  float pH_2;
-  float EC_mS_2;
-  float ORP_mV_2;
-  float MFC_mV_2;
-  float Temp_C_2;
+  float pH_1, EC_mS_1, ORP_mV_1, MFC_mV_1, Temp_C_1;
+  float pH_2, EC_mS_2, ORP_mV_2, MFC_mV_2, Temp_C_2;
 };
 
-// ------------ Forward Declarations ------------
+// ======================================================
+// ----------------- Prototypes -------------------------
 SensorData readSensors();
-void printSensors(const SensorData& data);
+void printSensors(const SensorData& data, int relayIndex);
 void allRelaysOff();
+
+float readORP(int pin);
+float readPH(int pin);
+float readEC(int pin);
+float readMFC(int pin);
+float readDS18B20(DallasTemperature& bus);
+float rawTo_mV(int raw);
 
 // ======================================================
 void setup() {
   Serial.begin(115200);
-  while (!Serial);
-
-  Serial.println("Starting Combined Sensor + Relay System...");
-  Serial.println("Tank 1: pH, EC, ORP, MFC, Temp");
-  Serial.println("Tank 2: pH, EC, ORP, MFC, Temp");
-  Serial.println("Relays: 6 channels (Active-High)");
-  Serial.println();
+  while (!Serial) {}
 
   analogReadResolution(12);
 
@@ -91,42 +124,53 @@ void setup() {
     pinMode(relays[i], OUTPUT);
     digitalWrite(relays[i], LOW);
   }
+
+  tempBus1.begin();
+  tempBus2.begin();
+
+  tempBus1.setWaitForConversion(true);
+  tempBus2.setWaitForConversion(true);
+  tempBus1.setResolution(12);
+  tempBus2.setResolution(12);
+
+  Serial.println("System Booted");
+  Serial.print("Temp sensors on D10: ");
+  Serial.println(tempBus1.getDeviceCount());
+  Serial.print("Temp sensors on D11: ");
+  Serial.println(tempBus2.getDeviceCount());
+  Serial.println();
 }
 
 // ======================================================
 void loop() {
-  unsigned long currentTime = millis();
+  unsigned long now = millis();
 
-  if (currentTime - lastSensorRead >= SENSOR_INTERVAL) {
+  if (!relayIsOn && now - lastRelayChange >= RELAY_OFF_TIME) {
+    allRelaysOff();
+    digitalWrite(relays[currentRelay], HIGH);
+    relayIsOn = true;
+    lastRelayChange = now;
+
     SensorData data = readSensors();
-    printSensors(data);
-    lastSensorRead = currentTime;
+    printSensors(data, currentRelay);
   }
 
-  if (!relayIsOn) {
-    if (currentTime - lastRelayChange >= RELAY_OFF_TIME) {
-      allRelaysOff();
-      Serial.print("Relay ON index ");
-      Serial.println(currentRelay);
-      digitalWrite(relays[currentRelay], HIGH);
-      relayIsOn = true;
-      lastRelayChange = currentTime;
-    }
-  } else {
-    if (currentTime - lastRelayChange >= RELAY_ON_TIME) {
-      digitalWrite(relays[currentRelay], LOW);
-      relayIsOn = false;
-      currentRelay = (currentRelay + 1) % RELAY_COUNT;
-      lastRelayChange = currentTime;
-    }
+  if (relayIsOn && now - lastRelayChange >= RELAY_ON_TIME) {
+    digitalWrite(relays[currentRelay], LOW);
+    relayIsOn = false;
+    currentRelay = (currentRelay + 1) % RELAY_COUNT;
+    lastRelayChange = now;
   }
 }
 
 // ======================================================
 void allRelaysOff() {
-  for (int i = 0; i < RELAY_COUNT; i++) {
-    digitalWrite(relays[i], LOW);
-  }
+  for (int i = 0; i < RELAY_COUNT; i++) digitalWrite(relays[i], LOW);
+}
+
+// ======================================================
+float rawTo_mV(int raw) {
+  return raw * 3300.0f / 4095.0f;
 }
 
 // ======================================================
@@ -136,83 +180,86 @@ float readORP(int pin) {
     sum += analogRead(pin);
     delayMicroseconds(100);
   }
-  float orp_raw = sum / (float)ORP_OVERSAMPLES;
-  float orp_mV = (orp_raw * VREF / ADC_MAX) * 1000.0;
-  return orp_mV + ORP_OFFSET;
+  float avg = sum / (float)ORP_OVERSAMPLES;
+  return (avg * VREF / ADC_MAX) * 1000.0f + ORP_OFFSET;
 }
 
 // ======================================================
 float readPH(int pin) {
-  int ph_raw = analogRead(pin);
-  float ph_voltage = ph_raw * (VREF / ADC_MAX);
-  return PH_SLOPE * ph_voltage + PH_INTERCEPT;
+  float v = analogRead(pin) * (VREF / ADC_MAX);
+  return PH_SLOPE * v + PH_INTERCEPT;
 }
 
 // ======================================================
 float readEC(int pin) {
-  int ec_raw = analogRead(pin);
-  float ec_mV = (float)ec_raw * 3300.0 / 4095.0;
-  return EC_SLOPE_MSPERMV * ec_mV + EC_OFFSET_MS;
-}
-
-// ======================================================
-float readTemp(int pin) {
-  int temp_raw = analogRead(pin);
-  float voltage = temp_raw * (VREF / ADC_MAX);
-  return (voltage + TEMP_OFFSET) * TEMP_SCALE;
+  return EC_SLOPE_MSPERMV * rawTo_mV(analogRead(pin)) + EC_OFFSET_MS;
 }
 
 // ======================================================
 float readMFC(int pin) {
-  int mfc_raw = analogRead(pin);
-  return (float)mfc_raw * 3300.0 / 4095.0;
+  return rawTo_mV(analogRead(pin));
+}
+
+// ======================================================
+float readDS18B20(DallasTemperature& bus) {
+  bus.requestTemperatures();
+  float c = bus.getTempCByIndex(0);
+
+  if (c == DEVICE_DISCONNECTED_C || c == 85.0f) return NAN;
+  if (c < -55.0f || c > 125.0f) return NAN;
+  return c;
 }
 
 // ======================================================
 SensorData readSensors() {
-  SensorData data;
+  SensorData d;
 
-  // Tank 1 Sensors
-  data.pH_1     = readPH(PH_PIN_1);
-  data.EC_mS_1  = readEC(EC_PIN_1);
-  data.ORP_mV_1 = readORP(ORP_PIN_1);
-  data.MFC_mV_1 = readMFC(MFC_PIN_1);
-  data.Temp_C_1 = readTemp(TEMP_PIN_1);
+  d.pH_1     = readPH(PH_PIN_1);
+  d.EC_mS_1  = readEC(EC_PIN_1);
+  d.ORP_mV_1 = readORP(ORP_PIN_1);
+  d.MFC_mV_1 = readMFC(MFC_PIN_1);
+  d.Temp_C_1 = readDS18B20(tempBus1);
 
-  // Tank 2 Sensors
-  data.pH_2     = readPH(PH_PIN_2);
-  data.EC_mS_2  = readEC(EC_PIN_2);
-  data.ORP_mV_2 = readORP(ORP_PIN_2);
-  
-  // A8 and A9 are pure analog - read directly
-  int mfc_raw_2 = analogRead(A9);
-  data.MFC_mV_2 = (float)mfc_raw_2 * 3300.0 / 4095.0;
-  
-  int temp_raw_2 = analogRead(A8);
-  float voltage_2 = temp_raw_2 * (VREF / ADC_MAX);
-  data.Temp_C_2 = (voltage_2 + TEMP_OFFSET) * TEMP_SCALE;
+  d.pH_2     = readPH(PH_PIN_2);
+  d.EC_mS_2  = readEC(EC_PIN_2);
+  d.ORP_mV_2 = readORP(ORP_PIN_2);
+  d.MFC_mV_2 = rawTo_mV(analogRead(MFC_PIN_2));
+  d.Temp_C_2 = readDS18B20(tempBus2);
 
-  return data;
+  return d;
 }
 
 // ======================================================
-void printSensors(const SensorData& data) {
-  Serial.println("========== SENSOR READINGS ==========");
-  
-  Serial.println("--- Tank 1 ---");
-  Serial.print("  pH:     "); Serial.println(data.pH_1, 2);
-  Serial.print("  EC:     "); Serial.print(data.EC_mS_1, 3); Serial.println(" mS/cm");
-  Serial.print("  ORP:    "); Serial.print(data.ORP_mV_1, 1); Serial.println(" mV");
-  Serial.print("  MFC:    "); Serial.print(data.MFC_mV_1, 1); Serial.println(" mV");
-  Serial.print("  Temp:   "); Serial.print(data.Temp_C_1, 1); Serial.println(" C");
+void printSensors(const SensorData& d, int r) {
+  Serial.print("Relay=");
+  Serial.print(r);
+  Serial.print(" | Pump=");
+  Serial.print(PUMP_NAME[r]);
+  Serial.print(" | ");
 
-  Serial.println("--- Tank 2 ---");
-  Serial.print("  pH:     "); Serial.println(data.pH_2, 2);
-  Serial.print("  EC:     "); Serial.print(data.EC_mS_2, 3); Serial.println(" mS/cm");
-  Serial.print("  ORP:    "); Serial.print(data.ORP_mV_2, 1); Serial.println(" mV");
-  Serial.print("  MFC:    "); Serial.print(data.MFC_mV_2, 1); Serial.println(" mV");
-  Serial.print("  Temp:   "); Serial.print(data.Temp_C_2, 1); Serial.println(" C");
+  Serial.print("T1: pH=");
+  Serial.print(d.pH_1, 2);
+  Serial.print(" EC=");
+  Serial.print(d.EC_mS_1, 2);
+  Serial.print("mS ORP=");
+  Serial.print(d.ORP_mV_1, 0);
+  Serial.print("mV MFC=");
+  Serial.print(d.MFC_mV_1, 0);
+  Serial.print("mV Temp=");
+  if (isnan(d.Temp_C_1)) Serial.print("NA");
+  else { Serial.print(d.Temp_C_1, 2); Serial.print("C"); }
 
-  Serial.println("=====================================");
+  Serial.print(" | T2: pH=");
+  Serial.print(d.pH_2, 2);
+  Serial.print(" EC=");
+  Serial.print(d.EC_mS_2, 2);
+  Serial.print("mS ORP=");
+  Serial.print(d.ORP_mV_2, 0);
+  Serial.print("mV MFC=");
+  Serial.print(d.MFC_mV_2, 0);
+  Serial.print("mV Temp=");
+  if (isnan(d.Temp_C_2)) Serial.print("NA");
+  else { Serial.print(d.Temp_C_2, 2); Serial.print("C"); }
+
   Serial.println();
 }
