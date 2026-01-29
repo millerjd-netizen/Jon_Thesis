@@ -59,44 +59,88 @@ const int PUMP_MOLWINE_2  = 7;
 // ================================================================
 const float VREF = 3.3f;
 const int   ADC_MAX = 4095;
+
+// Base linear pH conversion
 const float PH_SLOPE     = -5.59047f;
 const float PH_INTERCEPT = 15.835f;
+
+// Base linear EC conversion
 const float EC_SLOPE_MSPERMV = 0.00864f;
 const float EC_OFFSET_MS     = 0.033f;
-const float ORP_OFFSET = -1524.0f;
-const int ORP_OVERSAMPLES = 50;
+
+// ORP base offset and oversampling
+const float ORP_OFFSET_BASE = -1524.0f;
+const int   ORP_OVERSAMPLES = 50;
 
 // ================================================================
-// PUMP CALIBRATION - ADJUST AFTER CALIBRATION
+// PER-TANK SENSOR CALIBRATION
 // ================================================================
-const float ML_PER_SEC_URINE_1    = 1.0;
-const float ML_PER_SEC_SPIRFEOX_1 = 1.0;
-const float ML_PER_SEC_MOLWINE_1  = 1.0;
-const float ML_PER_SEC_URINE_2    = 1.0;
-const float ML_PER_SEC_SPIRFEOX_2 = 1.0;
-const float ML_PER_SEC_MOLWINE_2  = 1.0;
+
+// ORP trim (calibrated to 470mV solution)
+// Tank1 read 467 -> needs +3
+// Tank2 read 456 -> needs +14
+const float ORP_TRIM_1_mV = +3.0f;
+const float ORP_TRIM_2_mV = +14.0f;
+
+// pH quadratic correction: pH_true = A*pH_meas^2 + B*pH_meas + C
+// Tank 1: measured 10.00, 7.04, 4.12 for buffers 10, 7, 5
+const float PH1_A = 0.05588129365f;
+const float PH1_B = 0.06129626971f;
+const float PH1_C = 3.79890793785f;
+
+// Tank 2: measured 10.25, 7.31, 4.42 for buffers 10, 7, 5
+const float PH2_A = -0.07490f;
+const float PH2_B = 1.98897f;
+const float PH2_C = -5.76500f;
+
+// EC linear correction: EC_true = A*EC_meas + C
+// Tank1: 4.37 -> 1.413, 18.03 -> 12.88
+const float EC1_A = 0.83945827233f;
+const float EC1_C = -2.25543265007f;
+
+// Tank2: 3.86 -> 1.413, 17.06 -> 12.88
+const float EC2_A = 0.86871212121f;
+const float EC2_C = -1.94022878788f;
+
+// ================================================================
+// PUMP CALIBRATION (mL per second)
+// ================================================================
+// Calculated from 2-second tests:
+// Tank 1 Urine:    avg(1.34, 1.27, 1.37) / 2 = 0.663 mL/s
+// Tank 2 Urine:    avg(1.19, 1.22) / 2 = 0.603 mL/s
+// Tank 1 SpirFeOx: avg(0.81, 0.78, 0.78) / 2 = 0.395 mL/s
+// Tank 2 SpirFeOx: avg(0.69, 0.79, 0.69) / 2 = 0.362 mL/s
+// Tank 1 MolWine:  avg(1.43, 1.49) / 2 = 0.730 mL/s
+// Tank 2 MolWine:  avg(0.87, 1.22, 1.04) / 2 = 0.522 mL/s
+
+const float ML_PER_SEC_URINE_1    = 0.663f;
+const float ML_PER_SEC_SPIRFEOX_1 = 0.395f;
+const float ML_PER_SEC_MOLWINE_1  = 0.730f;
+const float ML_PER_SEC_URINE_2    = 0.603f;
+const float ML_PER_SEC_SPIRFEOX_2 = 0.362f;
+const float ML_PER_SEC_MOLWINE_2  = 0.522f;
 
 // ================================================================
 // REACTOR CONFIGURATION
 // ================================================================
-const float REACTOR_VOLUME_L = 1.0;
-const float BASE_HRT = 24.0;
-const float EMERGENCY_HRT = 3.0;
-const unsigned long DOSE_INTERVAL_MS = 60000;
+const float REACTOR_VOLUME_L = 0.875f;  // 875 mL
+const float BASE_HRT = 24.0f;
+const float EMERGENCY_HRT = 3.0f;
+const unsigned long DOSE_INTERVAL_MS = 300000;  // 5 minutes
 
 // ================================================================
 // TARGET RANGES
 // ================================================================
-const float PH_MIN = 6.5;
-const float PH_MAX = 7.5;
-const float PH_TARGET = 7.0;
+const float PH_MIN = 6.5f;
+const float PH_MAX = 7.5f;
+const float PH_TARGET = 7.0f;
 
 // ================================================================
 // BASELINE GROUP - FIXED RATIOS
 // ================================================================
-const float BASELINE_FRAC_URINE = 0.11;
-const float BASELINE_FRAC_SPIRFEOX = 0.32;
-const float BASELINE_FRAC_MOLWINE = 0.57;
+const float BASELINE_FRAC_URINE = 0.11f;
+const float BASELINE_FRAC_SPIRFEOX = 0.32f;
+const float BASELINE_FRAC_MOLWINE = 0.57f;
 
 // ================================================================
 // DATA STRUCTURES
@@ -122,7 +166,7 @@ struct DoseVolumes {
 // ================================================================
 unsigned long lastDoseTime = 0;
 unsigned long doseCount = 0;
-float elapsedHours = 0.0;
+float elapsedHours = 0.0f;
 
 // ================================================================
 // HELPER FUNCTIONS
@@ -144,23 +188,26 @@ float readDS18B20(DallasTemperature& bus) {
 // SENSOR READING FUNCTIONS
 // ================================================================
 
-float readORP(int pin) {
+float readORP(int pin, float trim_mV) {
   long sum = 0;
   for (int i = 0; i < ORP_OVERSAMPLES; i++) {
     sum += analogRead(pin);
     delayMicroseconds(100);
   }
   float avg = sum / (float)ORP_OVERSAMPLES;
-  return (avg * VREF / ADC_MAX) * 1000.0f + ORP_OFFSET;
+  float mV = (avg * VREF / ADC_MAX) * 1000.0f + ORP_OFFSET_BASE;
+  return mV + trim_mV;
 }
 
-float readPH(int pin) {
+float readPH_corrected(int pin, float A, float B, float C) {
   float v = analogRead(pin) * (VREF / ADC_MAX);
-  return PH_SLOPE * v + PH_INTERCEPT;
+  float pH_meas = PH_SLOPE * v + PH_INTERCEPT;
+  return (A * pH_meas * pH_meas) + (B * pH_meas) + C;
 }
 
-float readEC(int pin) {
-  return EC_SLOPE_MSPERMV * rawTo_mV(analogRead(pin)) + EC_OFFSET_MS;
+float readEC_corrected(int pin, float A, float C) {
+  float ec_meas = EC_SLOPE_MSPERMV * rawTo_mV(analogRead(pin)) + EC_OFFSET_MS;
+  return A * ec_meas + C;
 }
 
 float readMFC(int pin) {
@@ -169,9 +216,9 @@ float readMFC(int pin) {
 
 SensorData readTank1Sensors() {
   SensorData data;
-  data.pH     = readPH(PH_PIN_1);
-  data.EC_mS  = readEC(EC_PIN_1);
-  data.ORP_mV = readORP(ORP_PIN_1);
+  data.pH     = readPH_corrected(PH_PIN_1, PH1_A, PH1_B, PH1_C);
+  data.EC_mS  = readEC_corrected(EC_PIN_1, EC1_A, EC1_C);
+  data.ORP_mV = readORP(ORP_PIN_1, ORP_TRIM_1_mV);
   data.MFC_mV = readMFC(MFC_PIN_1);
   data.Temp_C = readDS18B20(tempBus1);
   return data;
@@ -179,9 +226,9 @@ SensorData readTank1Sensors() {
 
 SensorData readTank2Sensors() {
   SensorData data;
-  data.pH     = readPH(PH_PIN_2);
-  data.EC_mS  = readEC(EC_PIN_2);
-  data.ORP_mV = readORP(ORP_PIN_2);
+  data.pH     = readPH_corrected(PH_PIN_2, PH2_A, PH2_B, PH2_C);
+  data.EC_mS  = readEC_corrected(EC_PIN_2, EC2_A, EC2_C);
+  data.ORP_mV = readORP(ORP_PIN_2, ORP_TRIM_2_mV);
   data.MFC_mV = rawTo_mV(analogRead(MFC_PIN_2));
   data.Temp_C = readDS18B20(tempBus2);
   return data;
@@ -194,7 +241,7 @@ SensorData readTank2Sensors() {
 DoseVolumes calculateBaselineDose() {
   DoseVolumes dose;
   dose.HRT = BASE_HRT;
-  dose.Q_total_mL = (REACTOR_VOLUME_L * 1000.0) / (dose.HRT * 60.0);
+  dose.Q_total_mL = (REACTOR_VOLUME_L * 1000.0f) / (dose.HRT * 60.0f) * 5.0f;  // 5 min interval
   dose.Q_urine_mL   = dose.Q_total_mL * BASELINE_FRAC_URINE;
   dose.Q_spirfeox_mL = dose.Q_total_mL * BASELINE_FRAC_SPIRFEOX;
   dose.Q_molwine_mL = dose.Q_total_mL * BASELINE_FRAC_MOLWINE;
@@ -210,21 +257,21 @@ DoseVolumes calculateExperimentalDose(const SensorData& sensors) {
     dose.HRT = BASE_HRT;
   }
   
-  dose.Q_total_mL = (REACTOR_VOLUME_L * 1000.0) / (dose.HRT * 60.0);
+  dose.Q_total_mL = (REACTOR_VOLUME_L * 1000.0f) / (dose.HRT * 60.0f) * 5.0f;  // 5 min interval
   
-  float f_urine = 0.15;
-  float f_spirfeox = 0.30;
-  float f_molwine = 0.55;
+  float f_urine = 0.15f;
+  float f_spirfeox = 0.30f;
+  float f_molwine = 0.55f;
   
   float pH_error = sensors.pH - PH_TARGET;
   
-  if (fabs(pH_error) > 0.3) {
+  if (fabs(pH_error) > 0.3f) {
     if (pH_error > 0) {
-      f_molwine = min(0.8, f_molwine + 0.3);
-      f_urine = max(0.05, f_urine - 0.2);
+      f_molwine = min(0.8f, f_molwine + 0.3f);
+      f_urine = max(0.05f, f_urine - 0.2f);
     } else {
-      f_urine = min(0.8, f_urine + 0.3);
-      f_molwine = max(0.05, f_molwine - 0.2);
+      f_urine = min(0.8f, f_urine + 0.3f);
+      f_molwine = max(0.05f, f_molwine - 0.2f);
     }
   }
   
@@ -255,7 +302,7 @@ void allPumpsOff() {
 
 void runPump(int pin, float mL, float mL_per_sec, const char* pumpName, int tank) {
   if (mL <= 0) return;
-  unsigned long run_time_ms = (unsigned long)((mL / mL_per_sec) * 1000.0);
+  unsigned long run_time_ms = (unsigned long)((mL / mL_per_sec) * 1000.0f);
   
   Serial.print("  DOSING T");
   Serial.print(tank);
@@ -309,6 +356,7 @@ void printHeader() {
   Serial.println(F("================================================================================================================================================"));
   Serial.println(F("ANAEROBIC DIGESTER DUAL-TANK CONTROL SYSTEM"));
   Serial.println(F("Tank 1 = BASELINE (Fixed Ratios) | Tank 2 = EXPERIMENTAL (Adaptive Control)"));
+  Serial.println(F("Reactor Volume: 875 mL | Dose Interval: 5 minutes"));
   Serial.println(F("================================================================================================================================================"));
 }
 
@@ -408,6 +456,8 @@ void setup() {
   Serial.println(F(""));
   Serial.println(F("================================================================"));
   Serial.println(F("  ANAEROBIC DIGESTER CONTROL SYSTEM - STARTING"));
+  Serial.println(F("  Reactor Volume: 875 mL"));
+  Serial.println(F("  Dose Interval: 5 minutes"));
   Serial.println(F("  Run digester_logger.py on computer for CSV logging"));
   Serial.println(F("================================================================"));
   Serial.println(F(""));
@@ -416,6 +466,15 @@ void setup() {
   Serial.println(tempBus1.getDeviceCount());
   Serial.print(F("DS18B20 on D11 (Tank 2): "));
   Serial.println(tempBus2.getDeviceCount());
+  Serial.println(F(""));
+  
+  Serial.println(F("PUMP CALIBRATION (mL/sec):"));
+  Serial.print(F("  T1 Urine: ")); Serial.println(ML_PER_SEC_URINE_1, 3);
+  Serial.print(F("  T1 SpirFeOx: ")); Serial.println(ML_PER_SEC_SPIRFEOX_1, 3);
+  Serial.print(F("  T1 MolWine: ")); Serial.println(ML_PER_SEC_MOLWINE_1, 3);
+  Serial.print(F("  T2 Urine: ")); Serial.println(ML_PER_SEC_URINE_2, 3);
+  Serial.print(F("  T2 SpirFeOx: ")); Serial.println(ML_PER_SEC_SPIRFEOX_2, 3);
+  Serial.print(F("  T2 MolWine: ")); Serial.println(ML_PER_SEC_MOLWINE_2, 3);
   Serial.println(F(""));
   
   Serial.println(F("CSVHEADER,Time_hr,Tank,Group,Phase,Q_urine_mL,Q_spirfeox_mL,Q_molwine_mL,Q_total_mL,pH,EC_mS,ORP_mV,MFC_mV,Temp_C,HRT_hr"));
@@ -432,7 +491,7 @@ void loop() {
   unsigned long currentTime = millis();
   
   if (currentTime - lastDoseTime >= DOSE_INTERVAL_MS) {
-    elapsedHours = (doseCount * DOSE_INTERVAL_MS) / 3600000.0;
+    elapsedHours = (doseCount * DOSE_INTERVAL_MS) / 3600000.0f;
     
     SensorData sensors1 = readTank1Sensors();
     DoseVolumes dose1 = calculateBaselineDose();
