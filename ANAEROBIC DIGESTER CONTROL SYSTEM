@@ -105,14 +105,6 @@ const float EC2_C = -1.94022878788f;
 // ================================================================
 // PUMP CALIBRATION (mL per second)
 // ================================================================
-// Calculated from 2-second tests:
-// Tank 1 Urine:    avg(1.34, 1.27, 1.37) / 2 = 0.663 mL/s
-// Tank 2 Urine:    avg(1.19, 1.22) / 2 = 0.603 mL/s
-// Tank 1 SpirFeOx: avg(0.81, 0.78, 0.78) / 2 = 0.395 mL/s
-// Tank 2 SpirFeOx: avg(0.69, 0.79, 0.69) / 2 = 0.362 mL/s
-// Tank 1 MolWine:  avg(1.43, 1.49) / 2 = 0.730 mL/s
-// Tank 2 MolWine:  avg(0.87, 1.22, 1.04) / 2 = 0.522 mL/s
-
 const float ML_PER_SEC_URINE_1    = 0.663f;
 const float ML_PER_SEC_SPIRFEOX_1 = 0.395f;
 const float ML_PER_SEC_MOLWINE_1  = 0.730f;
@@ -126,7 +118,7 @@ const float ML_PER_SEC_MOLWINE_2  = 0.522f;
 const float REACTOR_VOLUME_L = 0.875f;  // 875 mL
 const float BASE_HRT = 24.0f;
 const float EMERGENCY_HRT = 3.0f;
-const unsigned long DOSE_INTERVAL_MS = 300000;  // 5 minutes
+const unsigned long DOSE_INTERVAL_MS = 60000;  // 1 minute
 
 // ================================================================
 // TARGET RANGES
@@ -241,7 +233,7 @@ SensorData readTank2Sensors() {
 DoseVolumes calculateBaselineDose() {
   DoseVolumes dose;
   dose.HRT = BASE_HRT;
-  dose.Q_total_mL = (REACTOR_VOLUME_L * 1000.0f) / (dose.HRT * 60.0f) * 5.0f;  // 5 min interval
+  dose.Q_total_mL = (REACTOR_VOLUME_L * 1000.0f) / (dose.HRT * 60.0f);  // per minute
   dose.Q_urine_mL   = dose.Q_total_mL * BASELINE_FRAC_URINE;
   dose.Q_spirfeox_mL = dose.Q_total_mL * BASELINE_FRAC_SPIRFEOX;
   dose.Q_molwine_mL = dose.Q_total_mL * BASELINE_FRAC_MOLWINE;
@@ -257,7 +249,7 @@ DoseVolumes calculateExperimentalDose(const SensorData& sensors) {
     dose.HRT = BASE_HRT;
   }
   
-  dose.Q_total_mL = (REACTOR_VOLUME_L * 1000.0f) / (dose.HRT * 60.0f) * 5.0f;  // 5 min interval
+  dose.Q_total_mL = (REACTOR_VOLUME_L * 1000.0f) / (dose.HRT * 60.0f);  // per minute
   
   float f_urine = 0.15f;
   float f_spirfeox = 0.30f;
@@ -356,7 +348,7 @@ void printHeader() {
   Serial.println(F("================================================================================================================================================"));
   Serial.println(F("ANAEROBIC DIGESTER DUAL-TANK CONTROL SYSTEM"));
   Serial.println(F("Tank 1 = BASELINE (Fixed Ratios) | Tank 2 = EXPERIMENTAL (Adaptive Control)"));
-  Serial.println(F("Reactor Volume: 875 mL | Dose Interval: 5 minutes"));
+  Serial.println(F("Reactor Volume: 875 mL | Dose Interval: 1 minute"));
   Serial.println(F("================================================================================================================================================"));
 }
 
@@ -457,7 +449,7 @@ void setup() {
   Serial.println(F("================================================================"));
   Serial.println(F("  ANAEROBIC DIGESTER CONTROL SYSTEM - STARTING"));
   Serial.println(F("  Reactor Volume: 875 mL"));
-  Serial.println(F("  Dose Interval: 5 minutes"));
+  Serial.println(F("  Dose Interval: 1 minute"));
   Serial.println(F("  Run digester_logger.py on computer for CSV logging"));
   Serial.println(F("================================================================"));
   Serial.println(F(""));
