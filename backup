@@ -22,18 +22,9 @@
  *   - Base HRT: 12 hr
  *   - Emergency HRT: 3 hr if pH outside [6.4, 7.6]
  *   - SINGLE INPUT pH control:
- *       pH < 6.7  -> URINE ONLY
+ *       pH < 6.7   -> URINE ONLY
  *       pH 6.7-7.3 -> SPIR+FeOx+Molasses ONLY (methanogen sweet spot)
- *       pH > 7.3  -> KOMBUCHA ONLY
- *
- * SPIRULINA+FeOx+Molasses:
- *   - Feed contains: 10 g/L FeOx, 2 g/L molasses
- *   - Dosed at full HRT rate when pH in window
- *   - Target: ~2 g/L iron oxide in tank
- *
- * TIMING:
- *   - Status print: every 2 sec
- *   - Dosing cycle: every 60 sec
+ *       pH > 7.3   -> KOMBUCHA ONLY
  *
  * pH:
  *   - 2-point LINEAR calibration directly from pH board voltage:
@@ -41,10 +32,11 @@
  *       pH 4 buffer: 1.7746 V
  *
  * ORP:
- *   - Grove 501Z sensor with official formula
- *   - ORP = 1320 - voltage_mV - OFFSET
- *   - Calibrated with 470mV solution
- *   - Typical anaerobic range: -400 to -200 mV
+ *   - Grove 501Z "official" style formula:
+ *       ORP_mV = 1320 - voltage_mV - OFFSET
+ *   - OFFSET recalibrated using 470mV standard:
+ *       ORP_V samples avg ≈ 1.14445 V at ~16.4C
+ *       OFFSET = 1320 - 1144.45 - 470 = -294.45 mV
  * ================================================================
  */
 
@@ -68,7 +60,7 @@ DallasTemperature tempBus1(&oneWire1);
 // ================================================================
 // PUMP PINS (TANK 1 ONLY)
 // ================================================================
-const int PUMP_KOMBUCHA_T1 = 2;  // D2 (was WINE)
+const int PUMP_KOMBUCHA_T1 = 2;  // D2
 const int PUMP_SPIRFEOX_T1 = 4;  // D4
 const int PUMP_URINE_T1    = 7;  // D7
 
@@ -97,12 +89,12 @@ const float PH_M = (PH7_TRUE - PH4_TRUE) / (PH7_V - PH4_V);
 const float PH_B = PH7_TRUE - (PH_M * PH7_V);
 
 // ================================================================
-// ORP CALIBRATION - GROVE 501Z OFFICIAL FORMULA
+// ORP CALIBRATION - GROVE 501Z "OFFICIAL" FORMULA
 // ================================================================
-// Official formula: ORP = 1320 - voltage_mV - OFFSET
-// Calibrated with 470mV solution at ~1.268V raw reading
-// 470 = 1320 - 1268 - OFFSET  =>  OFFSET = -418
-const float ORP_OFFSET = -418.0f;  // calibration offset in mV
+// ORP = 1320 - voltage_mV - OFFSET
+// Recalibrated in 470mV standard solution:
+// ORP_OFFSET ≈ -294.45 mV  (use -294.5f)
+const float ORP_OFFSET = -294.5f;  // <-- UPDATED
 
 // ================================================================
 // EC CALIBRATION (unchanged)
@@ -131,14 +123,13 @@ const unsigned long DOSE_INTERVAL_MS   = 60000; // 60s
 const unsigned long STATUS_INTERVAL_MS = 2000;  // 2s
 
 // ================================================================
-// pH LIMITS - SINGLE INPUT MODE (UPDATED FOR METHANOGEN SWEET SPOT)
+// pH LIMITS - SINGLE INPUT MODE
 // ================================================================
 const float PH_MIN_EMERGENCY = 6.4f;   // below: emergency urine
 const float PH_MAX_EMERGENCY = 7.6f;   // above: emergency kombucha
 
-// Single input thresholds - wide window for FeOx in methanogen range
 const float PH_URINE_MAX     = 6.7f;   // below 6.7: urine only
-const float PH_FEOX_MAX      = 7.3f;   // 6.7-7.3: FeOx only (0.6 pH window)
+const float PH_FEOX_MAX      = 7.3f;   // 6.7-7.3: FeOx only
 // above 7.3: kombucha only
 
 // ================================================================
@@ -233,15 +224,13 @@ float readMFC_T1_mV() {
 }
 
 float readORP_T1_mV(float voltage) {
-  // Official Grove 501Z formula (adjusted for 3.3V system)
-  // ORP = 1320 - voltage_mV - OFFSET
   float voltage_mV = voltage * 1000.0f;
   return 1320.0f - voltage_mV - ORP_OFFSET;
 }
 
 SensorData readTank1Sensors() {
   SensorData s;
-  
+
   // pH reading
   s.pH_ADC = readADC_avg(PH_PIN_1, 30, 2);
   s.pH_V   = adcToVolts(s.pH_ADC);
@@ -256,7 +245,7 @@ SensorData readTank1Sensors() {
   s.EC_mS  = readEC_T1_mS();
   s.MFC_mV = readMFC_T1_mV();
   s.Temp_C = readDS18B20(tempBus1);
-  
+
   return s;
 }
 
@@ -279,23 +268,18 @@ DoseVolumes calculateDose(const SensorData& s) {
 
   // SINGLE INPUT LOGIC - only one pump runs at a time
   if (s.pH < PH_MIN_EMERGENCY) {
-    // EMERGENCY LOW - urine only, fast HRT
     d.Q_urine_mL = Q_base;
   }
   else if (s.pH < PH_URINE_MAX) {
-    // LOW (6.4 - 6.7) - urine only
     d.Q_urine_mL = Q_base;
   }
   else if (s.pH <= PH_FEOX_MAX) {
-    // STABLE (6.7 - 7.3) - FeOx+molasses only (methanogen sweet spot)
     d.Q_spir_mL = Q_base;
   }
   else if (s.pH <= PH_MAX_EMERGENCY) {
-    // HIGH (7.3 - 7.6) - kombucha only
     d.Q_kombucha_mL = Q_base;
   }
   else {
-    // EMERGENCY HIGH - kombucha only, fast HRT
     d.Q_kombucha_mL = Q_base;
   }
 
@@ -376,7 +360,8 @@ void printStatus(const SensorData& s) {
   Serial.print(hrt, 1);
   Serial.print(emergency ? F(" [EMERGENCY] ") : F(" [BASE] "));
 
-  Serial.print(F("| V="));
+  // NOTE: This is pH voltage, not ORP voltage
+  Serial.print(F("| pH_V="));
   Serial.print(s.pH_V, 4);
   Serial.print(F(" ADC="));
   Serial.print(s.pH_ADC);
