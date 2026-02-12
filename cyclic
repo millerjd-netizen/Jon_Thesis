@@ -1,0 +1,780 @@
+/*
+ * ================================================================
+ * ANAEROBIC DIGESTER - TANK 1 ONLY (SINGLE INPUT MODE) + MFC GATE
+ * Arduino GIGA R1
+ * + pH STRESS TEST PROTOCOL
+ * ================================================================
+ *
+ * pH STRESS TEST STATE MACHINE:
+ *   STATE 0 - STABILIZE:    Dose normally to bring pH into healthy range (6.7-7.3)
+ *   STATE 1 - HOLD_HEALTHY: Hold pH in healthy range for 1 hour (normal dosing)
+ *   STATE 2 - STRESS_DOWN:  Force pH down toward 6.0 by dosing kombucha (acid)
+ *   STATE 3 - RECOVER:      Let normal dosing bring pH back to healthy range
+ *   STATE 4 - HOLD_RECOV:   Hold recovered pH for 1 hour (normal dosing)
+ *   Then loop back to STATE 2 forever.
+ *
+ * HOLD TIMER: starts once pH first enters healthy window.
+ *   Runs for 1 full hour regardless of brief pH drift.
+ *   Normal dosing continues during hold to maintain pH.
+ *
+ * TANK 1 PUMPS (UNCHANGED):
+ *   D7 = URINE
+ *   D2 = KOMBUCHA (wine)
+ *   D4 = SPIRULINA+FeOx+Molasses
+ *
+ * MFC ISOLATION / GATE RELAY:
+ *   D3 = RELAY MFC GATE
+ *
+ * DISABLED/UNUSED RELAYS (HARD OFF):
+ *   D5, D6 forced LOW continuously
+ *
+ * SENSORS (TANK 1):
+ *   A0 = pH
+ *   A1 = ORP (Grove 501Z)
+ *   A2 = EC
+ *   A3 = MFC (ADC read only when gate is ON)
+ *   D10 = Temperature (DS18B20)
+ *
+ * ORP/MFC TIMING (UNCHANGED):
+ *   Every 10 seconds, do:
+ *     - 5 points of ORP (one per second) while MFC gate OFF
+ *     - 5 points of MFC (one per second) while MFC gate ON, ORP skipped
+ *
+ * STATUS/CSV:
+ *   Still prints every 2 seconds.
+ *   ORP and MFC show as NA when not sampled at that moment.
+ *
+ * DOSING:
+ *   Still doses every 60 seconds (blocking).
+ *   Gate forced OFF during dosing.
+ *   Dose CONTENT now depends on stress test state.
+ * ================================================================
+ */
+
+#include <math.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// ================================================================
+// SENSOR PINS (TANK 1 ONLY)
+// ================================================================
+const int PH_PIN_1  = A0;
+const int ORP_PIN_1 = A1;
+const int EC_PIN_1  = A2;
+const int MFC_PIN_1 = A3;
+
+#define TEMP_PIN_1 10
+
+OneWire oneWire1(TEMP_PIN_1);
+DallasTemperature tempBus1(&oneWire1);
+
+// ================================================================
+// PUMP PINS (TANK 1 ONLY) - UNCHANGED
+// ================================================================
+const int PUMP_KOMBUCHA_T1 = 2;  // D2
+const int PUMP_SPIRFEOX_T1 = 4;  // D4
+const int PUMP_URINE_T1    = 7;  // D7
+
+// ================================================================
+// MFC GATE RELAY
+// ================================================================
+const int RELAY_MFC_GATE = 3; // D3
+
+// Many relay boards are ACTIVE-LOW. If your relay LED/click happens
+// when pin is LOW, flip these:
+const bool RELAY_ON  = HIGH;
+const bool RELAY_OFF = LOW;
+
+// ================================================================
+// DISABLED/UNUSED RELAYS (HARD OFF)
+// ================================================================
+const int RELAY_UNUSED_1 = 5; // D5
+const int RELAY_UNUSED_2 = 6; // D6
+
+// ================================================================
+// ADC / VOLTAGE SETTINGS
+// ================================================================
+const float VREF    = 3.3f;
+const int   ADC_MAX = 4095;
+
+// ================================================================
+// pH 2-POINT CALIBRATION (VOLTAGE DOMAIN)
+// ================================================================
+const float PH7_TRUE = 7.00f;
+const float PH4_TRUE = 4.00f;
+
+const float PH7_V = 1.3299f;
+const float PH4_V = 1.7746f;
+
+// pH = PH_M*V + PH_B
+const float PH_M = (PH7_TRUE - PH4_TRUE) / (PH7_V - PH4_V);
+const float PH_B = PH7_TRUE - (PH_M * PH7_V);
+
+// ================================================================
+// ORP CALIBRATION - GROVE 501Z
+// ORP = 1320 - voltage_mV - OFFSET
+// ================================================================
+const float ORP_OFFSET = -294.5f;
+
+// ================================================================
+// EC CALIBRATION
+// ================================================================
+const float EC_SLOPE_MSPERMV = 0.00864f;
+const float EC_OFFSET_MS     = 0.033f;
+const float EC1_A = 0.83945827233f;
+const float EC1_C = -2.25543265007f;
+
+// ================================================================
+// PUMP CALIBRATION (mL per second)
+// ================================================================
+const float ML_PER_SEC_URINE_T1    = 0.663f;
+const float ML_PER_SEC_KOMBUCHA_T1 = 0.730f;
+const float ML_PER_SEC_SPIRFEOX_T1 = 0.395f;
+
+// ================================================================
+// REACTOR CONFIG
+// ================================================================
+const float REACTOR_VOLUME_ML = 875.0f;
+
+const float HRT_BASE_HR      = 12.0f;
+const float HRT_EMERGENCY_HR = 3.0f;
+
+const unsigned long DOSE_INTERVAL_MS   = 60000; // 60s
+const unsigned long STATUS_INTERVAL_MS = 2000;  // 2s
+
+// ================================================================
+// pH LIMITS - SINGLE INPUT MODE (used by normal dosing)
+// ================================================================
+const float PH_MIN_EMERGENCY = 6.4f;
+const float PH_MAX_EMERGENCY = 7.6f;
+
+const float PH_URINE_MAX     = 6.7f;
+const float PH_FEOX_MAX      = 7.3f;
+
+// ================================================================
+// pH STRESS TEST SETTINGS
+// ================================================================
+const float PH_HEALTHY_LOW   = 6.7f;   // healthy range lower bound
+const float PH_HEALTHY_HIGH  = 7.3f;   // healthy range upper bound
+const float PH_STRESS_TARGET = 6.0f;   // stress target pH
+const float PH_STRESS_CLOSE  = 6.1f;   // close enough to call stress done
+const float PH_RECOVERED_LOW = 6.7f;   // recovery achieved when pH >= this
+
+const unsigned long HOLD_DURATION_MS = 3600000UL; // 1 hour in ms
+
+// Stress dose: how much kombucha to push per 60s cycle to drive pH down
+// Uses emergency-rate HRT for aggressive dosing during stress phase
+const float STRESS_HRT_HR = 3.0f;
+
+// ================================================================
+// STRESS TEST STATE MACHINE
+// ================================================================
+enum StressState {
+  ST_STABILIZE   = 0,  // bring pH into healthy range
+  ST_HOLD_INIT   = 1,  // hold healthy pH for 1 hour (first time)
+  ST_STRESS_DOWN = 2,  // push pH down to ~6.0
+  ST_RECOVER     = 3,  // let normal dosing recover pH
+  ST_HOLD_RECOV  = 4   // hold recovered pH for 1 hour, then back to ST_STRESS_DOWN
+};
+
+StressState stressState     = ST_STABILIZE;
+unsigned long holdStartMs   = 0;
+unsigned long stressCycle   = 0;  // counts how many stress/recover cycles completed
+
+// ================================================================
+// NEW ORP/MFC SAMPLING (5 ORP points, then 5 MFC points)
+// ================================================================
+const unsigned long SAMPLE_STEP_MS = 1000;  // 1 second per point
+const int ORP_POINTS = 5;
+const int MFC_POINTS = 5;
+const int TOTAL_POINTS = ORP_POINTS + MFC_POINTS; // 10
+
+unsigned long lastSampleStepMs = 0;
+int sampleIndex = 0; // 0..9 (0-4 ORP, 5-9 MFC)
+
+// ================================================================
+// DATA STRUCTURES
+// ================================================================
+struct SensorData {
+  float pH;
+  float pH_V;
+  int   pH_ADC;
+
+  float ORP_mV;
+  float ORP_V;
+  int   ORP_ADC;
+  bool  ORP_valid;
+
+  float EC_mS;
+
+  float MFC_mV;
+  bool  MFC_valid;
+
+  float Temp_C;
+};
+
+struct DoseVolumes {
+  float Q_urine_mL;
+  float Q_kombucha_mL;
+  float Q_spir_mL;
+  float Q_total_mL;
+  float HRT;
+  bool  emergency;
+};
+
+// ================================================================
+// TIMING STATE
+// ================================================================
+unsigned long lastDoseTime   = 0;
+unsigned long lastStatusTime = 0;
+unsigned long doseCount      = 0;
+
+// ================================================================
+// HELPERS
+// ================================================================
+float rawTo_mV(int raw) { return raw * 3300.0f / 4095.0f; }
+
+float clamp(float v, float lo, float hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+int readADC_avg(int pin, int n = 30, int delay_ms = 2) {
+  long sum = 0;
+  for (int i = 0; i < n; i++) {
+    sum += analogRead(pin);
+    delay(delay_ms);
+  }
+  return (int)(sum / n);
+}
+
+float adcToVolts(int adc) {
+  return ((float)adc) * (VREF / (float)ADC_MAX);
+}
+
+float readDS18B20(DallasTemperature& bus) {
+  bus.requestTemperatures();
+  float c = bus.getTempCByIndex(0);
+  if (c == DEVICE_DISCONNECTED_C || c == 85.0f) return NAN;
+  if (c < -55.0f || c > 125.0f) return NAN;
+  return c;
+}
+
+// ================================================================
+// HARD OFF SAFETY
+// ================================================================
+void forceUnusedRelaysOff() {
+  digitalWrite(RELAY_UNUSED_1, LOW);
+  digitalWrite(RELAY_UNUSED_2, LOW);
+}
+
+void allPumpsOff() {
+  digitalWrite(PUMP_URINE_T1, LOW);
+  digitalWrite(PUMP_KOMBUCHA_T1, LOW);
+  digitalWrite(PUMP_SPIRFEOX_T1, LOW);
+}
+
+// ================================================================
+// SENSOR READS (TANK 1)
+// ================================================================
+float readEC_T1_mS() {
+  float ec_meas = EC_SLOPE_MSPERMV * rawTo_mV(analogRead(EC_PIN_1)) + EC_OFFSET_MS;
+  return EC1_A * ec_meas + EC1_C;
+}
+
+float readMFC_T1_mV_single() {
+  return rawTo_mV(analogRead(MFC_PIN_1));
+}
+
+float readORP_T1_mV(float voltage) {
+  float voltage_mV = voltage * 1000.0f;
+  return 1320.0f - voltage_mV - ORP_OFFSET;
+}
+
+SensorData readTank1Sensors(bool doORP, bool doMFC) {
+  SensorData s;
+
+  // pH
+  s.pH_ADC = readADC_avg(PH_PIN_1, 30, 2);
+  s.pH_V   = adcToVolts(s.pH_ADC);
+  s.pH     = clamp(PH_M * s.pH_V + PH_B, 0.0f, 14.0f);
+
+  // ORP
+  if (doORP) {
+    s.ORP_ADC = readADC_avg(ORP_PIN_1, 30, 2);
+    s.ORP_V   = adcToVolts(s.ORP_ADC);
+    s.ORP_mV  = readORP_T1_mV(s.ORP_V);
+    s.ORP_valid = true;
+  } else {
+    s.ORP_ADC = 0;
+    s.ORP_V   = NAN;
+    s.ORP_mV  = NAN;
+    s.ORP_valid = false;
+  }
+
+  // EC
+  s.EC_mS = readEC_T1_mS();
+
+  // MFC
+  if (doMFC) {
+    s.MFC_mV = readMFC_T1_mV_single();
+    s.MFC_valid = true;
+  } else {
+    s.MFC_mV = NAN;
+    s.MFC_valid = false;
+  }
+
+  // Temp
+  s.Temp_C = readDS18B20(tempBus1);
+
+  return s;
+}
+
+// ================================================================
+// DOSE CALCULATION - NORMAL MODE (SINGLE INPUT)
+// Used during STABILIZE, HOLD, and RECOVER states
+// ================================================================
+DoseVolumes calculateDose_Normal(const SensorData& s) {
+  DoseVolumes d;
+
+  d.emergency = (s.pH < PH_MIN_EMERGENCY || s.pH > PH_MAX_EMERGENCY);
+  d.HRT = d.emergency ? HRT_EMERGENCY_HR : HRT_BASE_HR;
+
+  float Q_base = REACTOR_VOLUME_ML / (d.HRT * 60.0f);
+
+  d.Q_urine_mL    = 0.0f;
+  d.Q_kombucha_mL = 0.0f;
+  d.Q_spir_mL     = 0.0f;
+
+  if (s.pH < PH_MIN_EMERGENCY)       d.Q_urine_mL = Q_base;
+  else if (s.pH < PH_URINE_MAX)      d.Q_urine_mL = Q_base;
+  else if (s.pH <= PH_FEOX_MAX)      d.Q_spir_mL  = Q_base;
+  else                               d.Q_kombucha_mL = Q_base;
+
+  d.Q_total_mL = d.Q_urine_mL + d.Q_kombucha_mL + d.Q_spir_mL;
+  return d;
+}
+
+// ================================================================
+// DOSE CALCULATION - STRESS MODE
+// Forces kombucha (acid) to drive pH down toward target
+// ================================================================
+DoseVolumes calculateDose_Stress(const SensorData& s) {
+  DoseVolumes d;
+
+  d.emergency = false;
+  d.HRT = STRESS_HRT_HR;
+
+  float Q_base = REACTOR_VOLUME_ML / (d.HRT * 60.0f);
+
+  d.Q_urine_mL    = 0.0f;
+  d.Q_kombucha_mL = 0.0f;
+  d.Q_spir_mL     = 0.0f;
+
+  // If pH is still above stress target, keep pushing kombucha
+  if (s.pH > PH_STRESS_CLOSE) {
+    d.Q_kombucha_mL = Q_base;
+  }
+  // If we somehow overshoot below target, dose urine to prevent crashing too far
+  else if (s.pH < PH_STRESS_TARGET - 0.3f) {
+    d.Q_urine_mL = Q_base * 0.5f;  // gentle correction
+  }
+  // Otherwise at target, skip dosing this cycle
+
+  d.Q_total_mL = d.Q_urine_mL + d.Q_kombucha_mL + d.Q_spir_mL;
+  return d;
+}
+
+// ================================================================
+// MASTER DOSE CALCULATOR - routes to correct mode based on state
+// ================================================================
+DoseVolumes calculateDose(const SensorData& s) {
+  if (stressState == ST_STRESS_DOWN) {
+    return calculateDose_Stress(s);
+  } else {
+    return calculateDose_Normal(s);
+  }
+}
+
+// ================================================================
+// STRESS STATE NAME (for printing)
+// ================================================================
+const char* getStressStateName() {
+  switch (stressState) {
+    case ST_STABILIZE:   return "STABILIZE";
+    case ST_HOLD_INIT:   return "HOLD_1HR";
+    case ST_STRESS_DOWN: return "STRESS_DOWN";
+    case ST_RECOVER:     return "RECOVER";
+    case ST_HOLD_RECOV:  return "HOLD_RECOV_1HR";
+    default:             return "UNKNOWN";
+  }
+}
+
+// ================================================================
+// STRESS STATE MACHINE UPDATE
+// Called once per dose cycle with the latest pH reading.
+// Hold timer starts when pH first enters healthy window and
+// runs for 1 full hour regardless of brief pH drift.
+// ================================================================
+void updateStressState(float pH, unsigned long now) {
+  bool inHealthy = (pH >= PH_HEALTHY_LOW && pH <= PH_HEALTHY_HIGH);
+
+  switch (stressState) {
+
+    case ST_STABILIZE:
+      // Wait until pH first lands in healthy range
+      if (inHealthy) {
+        stressState = ST_HOLD_INIT;
+        holdStartMs = now;
+        Serial.println(F(""));
+        Serial.println(F(">>>>>> STATE -> HOLD_1HR (pH stabilized, starting 1hr hold) <<<<<<"));
+        Serial.println(F(""));
+      }
+      break;
+
+    case ST_HOLD_INIT:
+      // Timer runs for 1 hour from when it started - no reset on drift
+      if (now - holdStartMs >= HOLD_DURATION_MS) {
+        stressState = ST_STRESS_DOWN;
+        stressCycle++;
+        Serial.println(F(""));
+        Serial.print(F(">>>>>> STATE -> STRESS_DOWN (cycle "));
+        Serial.print(stressCycle);
+        Serial.println(F(", pulling pH to 6.0) <<<<<<"));
+        Serial.println(F(""));
+      }
+      break;
+
+    case ST_STRESS_DOWN:
+      // Wait until pH reaches stress target
+      if (pH <= PH_STRESS_CLOSE) {
+        stressState = ST_RECOVER;
+        Serial.println(F(""));
+        Serial.print(F(">>>>>> STATE -> RECOVER (pH reached "));
+        Serial.print(pH, 2);
+        Serial.println(F(", now recovering) <<<<<<"));
+        Serial.println(F(""));
+      }
+      break;
+
+    case ST_RECOVER:
+      // Wait until pH returns to healthy range
+      if (pH >= PH_RECOVERED_LOW && pH <= PH_HEALTHY_HIGH) {
+        stressState = ST_HOLD_RECOV;
+        holdStartMs = now;
+        Serial.println(F(""));
+        Serial.print(F(">>>>>> STATE -> HOLD_RECOV_1HR (pH recovered to "));
+        Serial.print(pH, 2);
+        Serial.println(F(", holding 1hr) <<<<<<"));
+        Serial.println(F(""));
+      }
+      break;
+
+    case ST_HOLD_RECOV:
+      // Timer runs for 1 hour from when it started - no reset on drift
+      if (now - holdStartMs >= HOLD_DURATION_MS) {
+        stressState = ST_STRESS_DOWN;
+        stressCycle++;
+        Serial.println(F(""));
+        Serial.print(F(">>>>>> STATE -> STRESS_DOWN (cycle "));
+        Serial.print(stressCycle);
+        Serial.println(F(", pulling pH to 6.0 again) <<<<<<"));
+        Serial.println(F(""));
+      }
+      break;
+  }
+}
+
+// ================================================================
+// PUMP RUNNER (blocking)
+// ================================================================
+void runPump_mL(int pin, float mL, float mL_per_sec, const char* name) {
+  if (mL <= 0.0f) {
+    Serial.print(F("  SKIP "));
+    Serial.print(name);
+    Serial.println(F(": 0.000 mL"));
+    return;
+  }
+
+  float seconds = mL / mL_per_sec;
+  unsigned long ms = (unsigned long)(seconds * 1000.0f);
+  if (ms < 30) ms = 30;
+
+  Serial.print(F("  RUN "));
+  Serial.print(name);
+  Serial.print(F(": "));
+  Serial.print(mL, 3);
+  Serial.print(F(" mL ("));
+  Serial.print(ms);
+  Serial.println(F(" ms)"));
+
+  digitalWrite(pin, HIGH);
+  delay(ms);
+  digitalWrite(pin, LOW);
+  delay(100);
+}
+
+void executeDose(const DoseVolumes& d) {
+  Serial.println(F("--- TANK 1 DOSING ---"));
+  runPump_mL(PUMP_URINE_T1,    d.Q_urine_mL,    ML_PER_SEC_URINE_T1,    "URINE (D7)");
+  runPump_mL(PUMP_KOMBUCHA_T1, d.Q_kombucha_mL, ML_PER_SEC_KOMBUCHA_T1, "KOMBUCHA (D2)");
+  runPump_mL(PUMP_SPIRFEOX_T1, d.Q_spir_mL,     ML_PER_SEC_SPIRFEOX_T1, "SPIR+Fe+Mol (D4)");
+  Serial.println(F("--- DONE ---"));
+}
+
+// ================================================================
+// STATUS PRINT
+// ================================================================
+const char* getPHMode(float pH) {
+  if (pH < PH_MIN_EMERGENCY) return "EMERG_LOW(urine)";
+  if (pH < PH_URINE_MAX)     return "LOW(urine)";
+  if (pH <= PH_FEOX_MAX)     return "STABLE(FeOx)";
+  if (pH <= PH_MAX_EMERGENCY) return "HIGH(kombucha)";
+  return "EMERG_HIGH(kombucha)";
+}
+
+void printStatus(const SensorData& s, float hrt, bool emergency, bool gateOn, int idx) {
+  unsigned long sec = millis() / 1000;
+
+  Serial.print(sec);
+  Serial.print(F("s | idx="));
+  Serial.print(idx);
+  Serial.print(F(" | Gate="));
+  Serial.print(gateOn ? F("ON ") : F("OFF "));
+
+  // Stress state
+  Serial.print(F("| ST="));
+  Serial.print(getStressStateName());
+  Serial.print(F(" "));
+
+  Serial.print(F("| pH="));
+  Serial.print(s.pH, 2);
+  Serial.print(F(" ("));
+  Serial.print(getPHMode(s.pH));
+  Serial.print(F(") "));
+
+  Serial.print(F("| EC="));
+  Serial.print(s.EC_mS, 2);
+  Serial.print(F("mS/cm "));
+
+  Serial.print(F("| ORP="));
+  if (s.ORP_valid) { Serial.print(s.ORP_mV, 0); Serial.print(F("mV ")); }
+  else             { Serial.print(F("SKIP ")); }
+
+  Serial.print(F("| MFC="));
+  if (s.MFC_valid) { Serial.print(s.MFC_mV, 0); Serial.print(F("mV ")); }
+  else             { Serial.print(F("SKIP ")); }
+
+  Serial.print(F("| HRT="));
+  Serial.print(hrt, 1);
+  Serial.print(emergency ? F(" [EMERGENCY] ") : F(" [BASE] "));
+
+  Serial.print(F("| Temp="));
+  if (isnan(s.Temp_C)) Serial.println(F("NA"));
+  else { Serial.print(s.Temp_C, 1); Serial.println(F("C")); }
+}
+
+// ================================================================
+// SETUP
+// ================================================================
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) {}
+  delay(200);
+
+  analogReadResolution(12);
+
+  // Pumps
+  pinMode(PUMP_URINE_T1, OUTPUT);
+  pinMode(PUMP_KOMBUCHA_T1, OUTPUT);
+  pinMode(PUMP_SPIRFEOX_T1, OUTPUT);
+  allPumpsOff();
+
+  // Unused relays hard-off
+  pinMode(RELAY_UNUSED_1, OUTPUT);
+  pinMode(RELAY_UNUSED_2, OUTPUT);
+  forceUnusedRelaysOff();
+
+  // MFC gate relay
+  pinMode(RELAY_MFC_GATE, OUTPUT);
+  digitalWrite(RELAY_MFC_GATE, RELAY_OFF);
+
+  // Temp
+  tempBus1.begin();
+  tempBus1.setWaitForConversion(true);
+  tempBus1.setResolution(12);
+
+  Serial.println(F(""));
+  Serial.println(F("================================================"));
+  Serial.println(F("  TANK 1 - SINGLE INPUT + MFC GATE"));
+  Serial.println(F("  + pH STRESS TEST PROTOCOL"));
+  Serial.println(F("  Pumps: URINE=D7, KOMBUCHA=D2, SPIR+Fe=D4"));
+  Serial.println(F("  MFC Gate Relay: D3"));
+  Serial.println(F("  Sampling: 5x ORP (1Hz, gate OFF) then 5x MFC (1Hz, gate ON)"));
+  Serial.println(F("  Status+CSV every 2s | Dose every 60s"));
+  Serial.println(F("================================================"));
+  Serial.println(F("  STRESS PROTOCOL:"));
+  Serial.println(F("    1. Stabilize pH to 6.7-7.3"));
+  Serial.println(F("    2. Hold 1 hour (timer starts on first entry, no reset)"));
+  Serial.println(F("    3. Stress pH down to 6.0 (kombucha)"));
+  Serial.println(F("    4. Recover to 6.7-7.3 (normal dosing)"));
+  Serial.println(F("    5. Hold 1 hour (timer starts on first entry, no reset)"));
+  Serial.println(F("    6. Repeat 3-5 forever"));
+  Serial.println(F("================================================"));
+  Serial.println(F(""));
+
+  Serial.println(F("CSVHEADER,Time_s,SampleIdx,GateOn,StressState,pH,EC_mS,ORP_mV,MFC_mV,Temp_C,Mode,HRT,Emergency,Q_urine,Q_kombucha,Q_spir"));
+
+  stressState      = ST_STABILIZE;
+  holdStartMs      = 0;
+  stressCycle      = 0;
+
+  lastDoseTime     = millis();
+  lastStatusTime   = millis();
+  lastSampleStepMs = millis();
+  sampleIndex      = 0;
+}
+
+// ================================================================
+// MAIN LOOP
+// ================================================================
+void loop() {
+  forceUnusedRelaysOff();
+
+  unsigned long now = millis();
+
+  // ---- advance the 1Hz sample index ----
+  if (now - lastSampleStepMs >= SAMPLE_STEP_MS) {
+    lastSampleStepMs += SAMPLE_STEP_MS;
+
+    sampleIndex++;
+    if (sampleIndex >= TOTAL_POINTS) sampleIndex = 0;
+  }
+
+  // Gate is OFF for ORP samples (0..4), ON for MFC samples (5..9)
+  bool gateOn = (sampleIndex >= ORP_POINTS);
+  digitalWrite(RELAY_MFC_GATE, gateOn ? RELAY_ON : RELAY_OFF);
+
+  // Status every 2 seconds
+  if (now - lastStatusTime >= STATUS_INTERVAL_MS) {
+    bool doORP = !gateOn; // ORP when gate OFF
+    bool doMFC =  gateOn; // MFC when gate ON
+
+    SensorData s = readTank1Sensors(doORP, doMFC);
+
+    bool emergency = (s.pH < PH_MIN_EMERGENCY || s.pH > PH_MAX_EMERGENCY);
+    float hrt;
+    if (stressState == ST_STRESS_DOWN) {
+      hrt = STRESS_HRT_HR;
+    } else {
+      hrt = emergency ? HRT_EMERGENCY_HR : HRT_BASE_HR;
+    }
+
+    printStatus(s, hrt, emergency, gateOn, sampleIndex);
+
+    DoseVolumes preview = calculateDose(s);
+
+    // CSV - now includes stress state
+    Serial.print(F("DATA,"));
+    Serial.print((unsigned long)(now / 1000));
+    Serial.print(F(","));
+    Serial.print(sampleIndex);
+    Serial.print(F(","));
+    Serial.print(gateOn ? 1 : 0);
+    Serial.print(F(","));
+    Serial.print(getStressStateName());
+    Serial.print(F(","));
+    Serial.print(s.pH, 3);
+    Serial.print(F(","));
+    Serial.print(s.EC_mS, 3);
+    Serial.print(F(","));
+    if (s.ORP_valid) Serial.print(s.ORP_mV, 1); else Serial.print(F("NA"));
+    Serial.print(F(","));
+    if (s.MFC_valid) Serial.print(s.MFC_mV, 1); else Serial.print(F("NA"));
+    Serial.print(F(","));
+    if (isnan(s.Temp_C)) Serial.print(F("NA")); else Serial.print(s.Temp_C, 2);
+    Serial.print(F(","));
+    Serial.print(getPHMode(s.pH));
+    Serial.print(F(","));
+    Serial.print(hrt, 1);
+    Serial.print(F(","));
+    Serial.print(emergency ? 1 : 0);
+    Serial.print(F(","));
+    Serial.print(preview.Q_urine_mL, 4);
+    Serial.print(F(","));
+    Serial.print(preview.Q_kombucha_mL, 4);
+    Serial.print(F(","));
+    Serial.println(preview.Q_spir_mL, 4);
+
+    lastStatusTime = now;
+  }
+
+  // Dose every 60 seconds
+  if (now - lastDoseTime >= DOSE_INTERVAL_MS) {
+    // Force gate OFF during dosing
+    digitalWrite(RELAY_MFC_GATE, RELAY_OFF);
+
+    Serial.println(F(""));
+    Serial.println(F("========================================"));
+    Serial.print(F("======= TANK 1 DOSING CYCLE | STATE: "));
+    Serial.print(getStressStateName());
+    Serial.print(F(" | Cycle: "));
+    Serial.print(stressCycle);
+    Serial.println(F(" ======="));
+    Serial.println(F("========================================"));
+
+    // Take a quick snapshot for dosing decision:
+    bool doORP = !gateOn;
+    SensorData s = readTank1Sensors(doORP, false);
+
+    // UPDATE STRESS STATE MACHINE before calculating dose
+    updateStressState(s.pH, now);
+
+    DoseVolumes d = calculateDose(s);
+
+    Serial.print(F("pH: "));
+    Serial.print(s.pH, 3);
+    Serial.print(F(" | ORP: "));
+    if (s.ORP_valid) { Serial.print(s.ORP_mV, 0); Serial.print(F("mV")); }
+    else             { Serial.print(F("SKIP")); }
+    Serial.print(F(" | Mode: "));
+    Serial.print(getPHMode(s.pH));
+    Serial.print(F(" | State: "));
+    Serial.print(getStressStateName());
+    Serial.print(F(" | HRT="));
+    Serial.print(d.HRT, 1);
+    Serial.print(F(" hr | emergency="));
+    Serial.println(d.emergency ? F("YES") : F("NO"));
+
+    Serial.print(F("Doses (mL): urine="));
+    Serial.print(d.Q_urine_mL, 4);
+    Serial.print(F(" kombucha="));
+    Serial.print(d.Q_kombucha_mL, 4);
+    Serial.print(F(" spir="));
+    Serial.print(d.Q_spir_mL, 4);
+    Serial.print(F(" total="));
+    Serial.println(d.Q_total_mL, 4);
+
+    // Print hold timer info if in a hold state
+    if (stressState == ST_HOLD_INIT || stressState == ST_HOLD_RECOV) {
+      unsigned long elapsed = now - holdStartMs;
+      unsigned long remaining = (elapsed < HOLD_DURATION_MS) ? (HOLD_DURATION_MS - elapsed) : 0;
+      Serial.print(F("Hold elapsed: "));
+      Serial.print(elapsed / 60000UL);
+      Serial.print(F(" min | remaining: "));
+      Serial.print(remaining / 60000UL);
+      Serial.println(F(" min"));
+    }
+
+    executeDose(d);
+
+    doseCount++;
+    Serial.print(F("Dose count: "));
+    Serial.println(doseCount);
+    Serial.println(F("========================================"));
+    Serial.println(F(""));
+
+    lastDoseTime = millis();
+  }
+}
