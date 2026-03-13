@@ -1,0 +1,90 @@
+// ===============================
+// SIMPLE RELAY SEQUENCER (ACTIVE-HIGH)
+// Tank 1 pump/relay pins only
+// One output ON at a time for 2 sec
+//
+// D2 = PUMP_KOMBUCHA (disabled in main sketch)
+// D3 = MFC GATE RELAY
+// D4 = PUMP_ACETATE
+// D8 = PUMP_URINE
+// ===============================
+
+#include "thingProperties.h"
+
+// -------------------------------
+// PIN DEFINITIONS
+// -------------------------------
+const int PIN_KOMBUCHA  = 2;
+const int PIN_MFC_GATE  = 3;
+const int PIN_ACETATE   = 4;
+const int PIN_URINE     = 8;
+
+const int pins[]   = { PIN_KOMBUCHA, PIN_MFC_GATE, PIN_ACETATE, PIN_URINE };
+const char* names[] = { "KOMBUCHA (D2)", "MFC_GATE (D3)", "ACETATE (D4)", "URINE (D8)" };
+
+const int PIN_COUNT = 4;
+
+// -------------------------------
+// TIMING
+// -------------------------------
+const unsigned long ON_TIME  = 2000;
+const unsigned long OFF_TIME = 500;
+
+// -------------------------------
+// HELPER
+// -------------------------------
+void allOff() {
+  for (int i = 0; i < PIN_COUNT; i++) {
+    digitalWrite(pins[i], LOW);
+  }
+}
+
+// -------------------------------
+// SETUP
+// -------------------------------
+void setup() {
+
+  Serial.begin(115200);
+  delay(1500);
+
+  Serial.println("Starting Tank 1 relay/pump sequencer (ACTIVE-HIGH)");
+  Serial.println("Pins: D2=KOMBUCHA, D3=MFC_GATE, D4=ACETATE, D8=URINE");
+
+  for (int i = 0; i < PIN_COUNT; i++) {
+    pinMode(pins[i], OUTPUT);
+    digitalWrite(pins[i], LOW);
+  }
+
+  // -------------------------------
+  // Arduino Cloud connection
+  // -------------------------------
+  initProperties();
+  ArduinoCloud.begin(ArduinoIoTPreferredConnection);
+
+  setDebugMessageLevel(2);
+  ArduinoCloud.printDebugInfo();
+}
+
+// -------------------------------
+// MAIN LOOP
+// -------------------------------
+void loop() {
+
+  // Keep device connected to Arduino Cloud
+  ArduinoCloud.update();
+
+  for (int i = 0; i < PIN_COUNT; i++) {
+
+    allOff();
+    delay(100);
+
+    Serial.print("ON: ");
+    Serial.println(names[i]);
+
+    digitalWrite(pins[i], HIGH);
+    delay(ON_TIME);
+
+    digitalWrite(pins[i], LOW);
+    delay(OFF_TIME);
+  }
+}
