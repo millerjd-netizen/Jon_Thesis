@@ -1,0 +1,431 @@
+/*
+ * ================================================================
+ * ANAEROBIC DIGESTER - TANK 1 - SYSTEM IDENTIFICATION MODE
+ * Arduino GIGA R1 WiFi
+ *
+ * 0–15 min   ACETATE     20 mL/dose  (50s pump ON, 10s OFF, repeat)
+ * 15–30 min  URINE       10 mL/min   (dose every 60s on the minute)
+ * 30–45 min  PHOSPHORIC   3 mL/min   (dose every 60s on the minute)
+ *
+ * Sensors: pH (A0), ORP (A1), EC (A2), MFC (A3), Temp (D10)
+ * Pumps:   Urine (D8), Acetate (D4), Phosphoric (D2)
+ * MFC Gate Relay: D3
+ * ================================================================
+ */
+
+#include "thingProperties.h"
+#include <math.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+const int PH_PIN_1  = A0;
+const int ORP_PIN_1 = A1;
+const int EC_PIN_1  = A2;
+const int MFC_PIN_1 = A3;
+
+#define TEMP_PIN_1 10
+
+OneWire oneWire1(TEMP_PIN_1);
+DallasTemperature tempBus1(&oneWire1);
+
+const int PUMP_PHOSPHORIC_T1 = 2;
+const int PUMP_ACETATE_T1    = 4;
+const int PUMP_URINE_T1      = 8;
+const int RELAY_MFC_GATE     = 3;
+const int RELAY_UNUSED_1     = 5;
+const int RELAY_UNUSED_2     = 6;
+
+const bool RELAY_ON  = HIGH;
+const bool RELAY_OFF = LOW;
+
+const float VREF    = 3.3f;
+const int   ADC_MAX = 4095;
+
+// ── pH calibration ─────────────────────────────────────────────────
+const float PH7_TRUE = 7.00f;
+const float PH4_TRUE = 4.00f;
+const float PH7_V    = 1.2355f;
+const float PH4_V    = 1.6335f;
+const float PH_M     = (PH7_TRUE - PH4_TRUE) / (PH7_V - PH4_V);
+const float PH_B     = PH7_TRUE - (PH_M * PH7_V);
+
+// ── sensor calibration ─────────────────────────────────────────────
+const float ORP_OFFSET       = -260.471f;
+const float EC_SLOPE_MSPERMV = 1.5669f;
+const float EC_OFFSET_MS     = 1.1858f;
+
+// ── pump flow rates (mL/s) ─────────────────────────────────────────
+const float ML_PER_SEC_URINE_T1      = 0.663f;
+const float ML_PER_SEC_ACETATE_T1    = 0.395f;
+const float ML_PER_SEC_PHOSPHORIC_T1 = 0.200f;
+
+// ── PHASE 1: Acetate — 50s ON, 10s OFF, repeat for 15 min ─────────
+const float         DOSE_ML_ACETATE    = 20.0f;        // 20/0.395 = ~50.6s pump
+const unsigned long ACETATE_ON_MS      = 50600UL;      // ~50.6s ON
+const unsigned long ACETATE_OFF_MS     = 10000UL;      // 10s OFF
+const unsigned long PHASE1_DURATION_MS = 15UL * 60UL * 1000UL;
+
+// ── PHASE 2: Urine — 10 mL on the minute, every 60s for 15 min ────
+const float         DOSE_ML_URINE      = 10.0f;        // 10/0.663 = ~15.1s pump
+const unsigned long URINE_INTERVAL_MS  = 60000UL;      // every 60s
+const unsigned long PHASE2_DURATION_MS = 15UL * 60UL * 1000UL;
+
+// ── PHASE 3: Phosphoric — 3 mL on the minute, every 60s for 15 min
+const float         DOSE_ML_PHOSPHORIC  = 3.0f;        // 3/0.200 = 15.0s pump
+const unsigned long PHOSPHORIC_INTERVAL_MS = 60000UL;  // every 60s
+const unsigned long PHASE3_DURATION_MS = 15UL * 60UL * 1000UL;
+
+// ── MFC gate cycling ───────────────────────────────────────────────
+const unsigned long SAMPLE_STEP_MS = 1000;
+const int ORP_POINTS   = 5;
+const int MFC_POINTS   = 5;
+const int TOTAL_POINTS = ORP_POINTS + MFC_POINTS;
+unsigned long lastSampleStepMs = 0;
+int sampleIndex = 0;
+
+// ── timing and state ───────────────────────────────────────────────
+const unsigned long STATUS_INTERVAL_MS = 2000;
+const unsigned long CLOUD_INTERVAL_MS  = 5000;
+
+enum Phase { ACETATE_PHASE, URINE_PHASE, PHOSPHORIC_PHASE, DONE };
+const char* PHASE_NAMES[] = { "ACETATE", "URINE", "PHOSPHORIC", "DONE" };
+Phase currentPhase = ACETATE_PHASE;
+
+unsigned long phaseStartMs   = 0;
+unsigned long lastDoseMs     = 0;
+unsigned long lastStatusMs   = 0;
+unsigned long lastCloudMs    = 0;
+unsigned long doseCount      = 0;
+
+// acetate sub-state
+bool acetateOn = false;
+unsigned long acetateStateStartMs = 0;
+
+float latest_pH   = 0.0f;
+float latest_EC   = 0.0f;
+float latest_ORP  = 0.0f;
+float latest_MFC  = 0.0f;
+float latest_Temp = 0.0f;
+float latest_Q_uri = 0.0f;
+float latest_Q_ace = 0.0f;
+float latest_Q_pho = 0.0f;
+bool  latest_gate  = false;
+
+// ── helpers ────────────────────────────────────────────────────────
+float adcToVolts(int adc) {
+    return ((float)adc) * (VREF / (float)ADC_MAX);
+}
+
+int readADC_avg(int pin, int n = 30) {
+    long sum = 0;
+    for (int i = 0; i < n; i++) { sum += analogRead(pin); delay(2); }
+    return (int)(sum / n);
+}
+
+float readPH() {
+    float v = adcToVolts(readADC_avg(PH_PIN_1));
+    float ph = PH_M * v + PH_B;
+    if (ph < 0.0f)  ph = 0.0f;
+    if (ph > 14.0f) ph = 14.0f;
+    return ph;
+}
+
+float readEC() {
+    float v = adcToVolts(readADC_avg(EC_PIN_1));
+    return EC_SLOPE_MSPERMV * v + EC_OFFSET_MS;
+}
+
+float readORP() {
+    float v = adcToVolts(readADC_avg(ORP_PIN_1));
+    return 1320.0f - (v * 1000.0f) - ORP_OFFSET;
+}
+
+float readMFC() {
+    return analogRead(MFC_PIN_1) * 3300.0f / 4095.0f;
+}
+
+float readTemp() {
+    tempBus1.requestTemperatures();
+    float c = tempBus1.getTempCByIndex(0);
+    if (c == DEVICE_DISCONNECTED_C || c == 85.0f) return NAN;
+    if (c < -55.0f || c > 125.0f) return NAN;
+    return c;
+}
+
+void runPump_mL(int pin, float mL, float mL_per_sec, const char* name) {
+    if (mL <= 0.0f) return;
+    unsigned long ms = (unsigned long)((mL / mL_per_sec) * 1000.0f);
+    if (ms < 30) ms = 30;
+    Serial.print(F("  PUMP ")); Serial.print(name);
+    Serial.print(F(": ")); Serial.print(mL, 3);
+    Serial.print(F(" mL (")); Serial.print(ms); Serial.println(F(" ms)"));
+    digitalWrite(pin, HIGH);
+    delay(ms);
+    digitalWrite(pin, LOW);
+    delay(100);
+}
+
+void syncCloud() {
+    cloud_pH            = latest_pH;
+    cloud_EC_mS         = latest_EC;
+    cloud_ORP_mV        = latest_ORP;
+    cloud_MFC_mV        = latest_MFC;
+    cloud_Temp_C        = latest_Temp;
+    cloud_gateOn        = latest_gate;
+    cloud_Q_urine_mL    = latest_Q_uri;
+    cloud_Q_spir_mL     = latest_Q_ace;
+    cloud_Q_kombucha_mL = latest_Q_pho;
+    cloud_stressState   = String(PHASE_NAMES[currentPhase]);
+    cloud_stressCycle   = (int)doseCount;
+    cloud_HRT           = 0.0f;
+    cloud_emergency     = false;
+    unsigned long elapsed   = millis() - phaseStartMs;
+    unsigned long phaseDur  = (currentPhase == ACETATE_PHASE)    ? PHASE1_DURATION_MS :
+                              (currentPhase == URINE_PHASE)      ? PHASE2_DURATION_MS :
+                              (currentPhase == PHOSPHORIC_PHASE) ? PHASE3_DURATION_MS : 0;
+    cloud_holdRemaining_min = (int)((phaseDur > elapsed ? phaseDur - elapsed : 0) / 60000UL);
+}
+
+// ── setup ──────────────────────────────────────────────────────────
+void setup() {
+    Serial.begin(115200);
+    delay(1500);
+
+    analogReadResolution(12);
+
+    pinMode(PUMP_URINE_T1,      OUTPUT); digitalWrite(PUMP_URINE_T1,      LOW);
+    pinMode(PUMP_ACETATE_T1,    OUTPUT); digitalWrite(PUMP_ACETATE_T1,    LOW);
+    pinMode(PUMP_PHOSPHORIC_T1, OUTPUT); digitalWrite(PUMP_PHOSPHORIC_T1, LOW);
+    pinMode(RELAY_MFC_GATE,     OUTPUT); digitalWrite(RELAY_MFC_GATE,     RELAY_OFF);
+    pinMode(RELAY_UNUSED_1,     OUTPUT); digitalWrite(RELAY_UNUSED_1,     LOW);
+    pinMode(RELAY_UNUSED_2,     OUTPUT); digitalWrite(RELAY_UNUSED_2,     LOW);
+
+    tempBus1.begin();
+    tempBus1.setWaitForConversion(true);
+    tempBus1.setResolution(12);
+
+    initProperties();
+    ArduinoCloud.begin(ArduinoIoTPreferredConnection);
+    setDebugMessageLevel(2);
+    ArduinoCloud.printDebugInfo();
+
+    unsigned long now = millis();
+    phaseStartMs        = now;
+    acetateStateStartMs = now;
+    acetateOn           = false;   // start with OFF so first transition fires ON immediately
+    lastDoseMs          = now;
+    lastStatusMs        = now;
+    lastSampleStepMs    = now;
+    lastCloudMs         = now;
+
+    Serial.println(F("================================================"));
+    Serial.println(F("  SYSTEM IDENTIFICATION MODE"));
+    Serial.println(F("  Phase 1 — ACETATE  : 50s ON / 10s OFF x 15 min"));
+    Serial.print  (F("            dose=")); Serial.print(DOSE_ML_ACETATE,1);
+    Serial.print  (F(" mL  pump=")); Serial.print(DOSE_ML_ACETATE/ML_PER_SEC_ACETATE_T1,1);
+    Serial.println(F("s"));
+    Serial.println(F("  Phase 2 — URINE    : 10 mL every 60s x 15 min"));
+    Serial.print  (F("            pump=")); Serial.print(DOSE_ML_URINE/ML_PER_SEC_URINE_T1,1);
+    Serial.println(F("s"));
+    Serial.println(F("  Phase 3 — PHOSPHORIC: 3 mL every 60s x 15 min"));
+    Serial.print  (F("            pump=")); Serial.print(DOSE_ML_PHOSPHORIC/ML_PER_SEC_PHOSPHORIC_T1,1);
+    Serial.println(F("s"));
+    Serial.println(F("================================================"));
+    Serial.println(F("CSVHEADER,Time_s,Phase,Dose,pH,EC_mS,ORP_mV,MFC_mV,Temp_C,Q_mL"));
+}
+
+// ── main loop ──────────────────────────────────────────────────────
+void loop() {
+    ArduinoCloud.update();
+    digitalWrite(RELAY_UNUSED_1, LOW);
+    digitalWrite(RELAY_UNUSED_2, LOW);
+
+    unsigned long now = millis();
+
+    // ── MFC gate cycling ───────────────────────────────────────────
+    if (now - lastSampleStepMs >= SAMPLE_STEP_MS) {
+        lastSampleStepMs += SAMPLE_STEP_MS;
+        if (++sampleIndex >= TOTAL_POINTS) sampleIndex = 0;
+    }
+    bool gateOn = (sampleIndex >= ORP_POINTS);
+    digitalWrite(RELAY_MFC_GATE, gateOn ? RELAY_ON : RELAY_OFF);
+    latest_gate = gateOn;
+
+    // ── sensor logging every 2s ────────────────────────────────────
+    if (now - lastStatusMs >= STATUS_INTERVAL_MS) {
+        float pH   = readPH();
+        float EC   = readEC();
+        float ORP  = !gateOn ? readORP() : latest_ORP;
+        float MFC  =  gateOn ? readMFC() : latest_MFC;
+        float Temp = readTemp();
+
+        latest_pH = pH; latest_EC = EC;
+        if (!gateOn) latest_ORP = ORP;
+        if ( gateOn) latest_MFC = MFC;
+        if (!isnan(Temp)) latest_Temp = Temp;
+
+        Serial.print(F("DATA,"));
+        Serial.print(now / 1000);
+        Serial.print(F(",")); Serial.print(PHASE_NAMES[currentPhase]);
+        Serial.print(F(",0,"));
+        Serial.print(pH,  3); Serial.print(F(","));
+        Serial.print(EC,  3); Serial.print(F(","));
+        Serial.print(ORP, 1); Serial.print(F(","));
+        Serial.print(MFC, 1); Serial.print(F(","));
+        if (isnan(Temp)) Serial.print(F("NA")); else Serial.print(Temp, 2);
+        Serial.println(F(",0.0000"));
+
+        lastStatusMs = now;
+    }
+
+    // ── cloud sync every 5s ────────────────────────────────────────
+    if (now - lastCloudMs >= CLOUD_INTERVAL_MS) {
+        syncCloud();
+        lastCloudMs = now;
+    }
+
+    if (currentPhase == DONE) return;
+
+    // ── phase transition check ─────────────────────────────────────
+    unsigned long phaseElapsed = now - phaseStartMs;
+    unsigned long phaseDur     = (currentPhase == ACETATE_PHASE)    ? PHASE1_DURATION_MS :
+                                 (currentPhase == URINE_PHASE)      ? PHASE2_DURATION_MS :
+                                 (currentPhase == PHOSPHORIC_PHASE) ? PHASE3_DURATION_MS : 0;
+
+    if (phaseElapsed >= phaseDur) {
+        // stop acetate pump if it was on
+        digitalWrite(PUMP_ACETATE_T1, LOW);
+        acetateOn = false;
+
+        if      (currentPhase == ACETATE_PHASE)    currentPhase = URINE_PHASE;
+        else if (currentPhase == URINE_PHASE)      currentPhase = PHOSPHORIC_PHASE;
+        else if (currentPhase == PHOSPHORIC_PHASE) {
+            currentPhase = DONE;
+            Serial.println(F("\n========================================"));
+            Serial.println(F("  ALL PHASES COMPLETE — logging only"));
+            Serial.println(F("========================================\n"));
+            return;
+        }
+
+        phaseStartMs = now;
+        lastDoseMs   = now - URINE_INTERVAL_MS;  // fire first dose immediately on entry
+        Serial.println(F("\n========================================"));
+        Serial.print(F("  PHASE -> ")); Serial.println(PHASE_NAMES[currentPhase]);
+        Serial.println(F("========================================\n"));
+        return;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // PHASE 1 — ACETATE: 50s ON / 10s OFF non-blocking
+    // ══════════════════════════════════════════════════════════════
+    if (currentPhase == ACETATE_PHASE) {
+        unsigned long stateElapsed = now - acetateStateStartMs;
+
+        if (!acetateOn && stateElapsed >= ACETATE_OFF_MS) {
+            // OFF period done — turn ON
+            digitalWrite(RELAY_MFC_GATE, RELAY_OFF);
+            digitalWrite(PUMP_ACETATE_T1, HIGH);
+            acetateOn           = true;
+            acetateStateStartMs = now;
+            latest_Q_ace        = DOSE_ML_ACETATE;
+            doseCount++;
+
+            float pH   = readPH();
+            float EC   = readEC();
+            float ORP  = readORP();
+            float Temp = readTemp();
+            latest_pH = pH; latest_EC = EC; latest_ORP = ORP;
+
+            Serial.print(F("DATA,"));
+            Serial.print(now / 1000);
+            Serial.print(F(",ACETATE,1,"));
+            Serial.print(pH, 3); Serial.print(F(","));
+            Serial.print(EC, 3); Serial.print(F(","));
+            Serial.print(ORP,1); Serial.print(F(",NA,"));
+            if (isnan(Temp)) Serial.print(F("NA")); else Serial.print(Temp, 2);
+            Serial.print(F(",")); Serial.println(DOSE_ML_ACETATE, 4);
+
+        } else if (acetateOn && stateElapsed >= ACETATE_ON_MS) {
+            // ON period done — turn OFF
+            digitalWrite(PUMP_ACETATE_T1, LOW);
+            acetateOn           = false;
+            acetateStateStartMs = now;
+            latest_Q_ace        = 0.0f;
+
+            Serial.print(F("  ACETATE OFF at ")); Serial.print(now/1000); Serial.println(F("s"));
+        }
+        return;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // PHASE 2 — URINE: 10 mL every 60s
+    // ══════════════════════════════════════════════════════════════
+    if (currentPhase == URINE_PHASE) {
+        if (now - lastDoseMs >= URINE_INTERVAL_MS) {
+            digitalWrite(RELAY_MFC_GATE, RELAY_OFF);
+            latest_Q_uri = DOSE_ML_URINE;
+            latest_Q_ace = 0.0f;
+            latest_Q_pho = 0.0f;
+
+            Serial.print(F("\n--- DOSE #")); Serial.print(doseCount);
+            Serial.println(F(" | URINE"));
+            runPump_mL(PUMP_URINE_T1, DOSE_ML_URINE, ML_PER_SEC_URINE_T1, "URINE");
+
+            float pH   = readPH();
+            float EC   = readEC();
+            float ORP  = readORP();
+            float Temp = readTemp();
+            latest_pH = pH; latest_EC = EC; latest_ORP = ORP;
+
+            Serial.print(F("DATA,"));
+            Serial.print(now / 1000);
+            Serial.print(F(",URINE,1,"));
+            Serial.print(pH, 3); Serial.print(F(","));
+            Serial.print(EC, 3); Serial.print(F(","));
+            Serial.print(ORP,1); Serial.print(F(",NA,"));
+            if (isnan(Temp)) Serial.print(F("NA")); else Serial.print(Temp, 2);
+            Serial.print(F(",")); Serial.println(DOSE_ML_URINE, 4);
+
+            doseCount++;
+            lastDoseMs = now;
+            syncCloud();
+        }
+        return;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // PHASE 3 — PHOSPHORIC: 3 mL every 60s
+    // ══════════════════════════════════════════════════════════════
+    if (currentPhase == PHOSPHORIC_PHASE) {
+        if (now - lastDoseMs >= PHOSPHORIC_INTERVAL_MS) {
+            digitalWrite(RELAY_MFC_GATE, RELAY_OFF);
+            latest_Q_pho = DOSE_ML_PHOSPHORIC;
+            latest_Q_uri = 0.0f;
+            latest_Q_ace = 0.0f;
+
+            Serial.print(F("\n--- DOSE #")); Serial.print(doseCount);
+            Serial.println(F(" | PHOSPHORIC"));
+            runPump_mL(PUMP_PHOSPHORIC_T1, DOSE_ML_PHOSPHORIC, ML_PER_SEC_PHOSPHORIC_T1, "PHOSPHORIC");
+
+            float pH   = readPH();
+            float EC   = readEC();
+            float ORP  = readORP();
+            float Temp = readTemp();
+            latest_pH = pH; latest_EC = EC; latest_ORP = ORP;
+
+            Serial.print(F("DATA,"));
+            Serial.print(now / 1000);
+            Serial.print(F(",PHOSPHORIC,1,"));
+            Serial.print(pH, 3); Serial.print(F(","));
+            Serial.print(EC, 3); Serial.print(F(","));
+            Serial.print(ORP,1); Serial.print(F(",NA,"));
+            if (isnan(Temp)) Serial.print(F("NA")); else Serial.print(Temp, 2);
+            Serial.print(F(",")); Serial.println(DOSE_ML_PHOSPHORIC, 4);
+
+            doseCount++;
+            lastDoseMs = now;
+            syncCloud();
+        }
+        return;
+    }
+}
