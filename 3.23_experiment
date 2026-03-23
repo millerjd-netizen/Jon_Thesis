@@ -1,0 +1,538 @@
+/*
+ * ================================================================
+ * ANAEROBIC DIGESTER - TANK 1
+ * LQR (3-STATE) vs BASELINE EXPERIMENT
+ * Arduino GIGA R1 WiFi
+ *
+ * STATES:  x = [VFA (mg/L), EC (mS/cm), pH]
+ * INPUTS:  u = [u_urine, u_acetate]  (mL/step, phosphoric uncontrolled)
+ * OUTPUTS: y = [EC, pH]              (VFA unmeasured – Kalman estimated)
+ *
+ * EXPERIMENT SEQUENCE (repeating forever):
+ *
+ *   PHASE 1 — ACID DOSE:    Dose phosphoric until pH <= PH_LOWER_BOUND
+ *   PHASE 2 — LQR RUN:      Run LQR controller for LQR_DURATION_MS (4 h)
+ *                            Logs per-minute total flow for baseline mirror
+ *   PHASE 3 — ACID DOSE:    Dose phosphoric until pH <= PH_LOWER_BOUND
+ *   PHASE 4 — BASELINE RUN: 50:50 urine/acetate split at same per-minute
+ *                            total flow as LQR used (mirrored from log)
+ *   → Repeat from PHASE 1
+ *
+ * SENSORS:  pH (A11), ORP (A1), EC (A2), MFC (A3), Temp (D10 OneWire)
+ * PUMPS:    Urine (D8), Acetate (D4), Phosphoric (D2)
+ * MFC GATE: Relay D3
+ *
+ * CALIBRATION:
+ *   pH  : PH_M=-5.366  PH_B=15.714
+ *         (pH7 raw V=1.624, pH10 raw V=1.065)
+ *         NOTE: Probe was new on 23 Mar 2026 — recalibrate after
+ *         soaking 30-60 min in pH7 buffer.
+ *   EC  : slope=9.006 mS/V  offset=-5.567 mS
+ *         (1.413 mS @ 0.775V, 12.88 mS @ 2.048V)
+ *   ORP : offset=-652.0 mV  (470mV std @ 1.502V)
+ *
+ * NOTE: pH and ORP only read during gate LOW window (relay settled)
+ *       MFC only read during gate HIGH window (relay settled)
+ *       100ms settle delay after every relay switch
+ * ================================================================
+ */
+
+#include "thingProperties.h"
+#include <math.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// ── Pins ──────────────────────────────────────────────────────────────────────
+#define   PH_PIN_1   A11
+#define   ORP_PIN_1  A1
+const int EC_PIN_1           = A2;
+const int MFC_PIN_1          = A3;
+const int PUMP_PHOSPHORIC_T1 = 2;
+const int PUMP_ACETATE_T1    = 4;
+const int PUMP_URINE_T1      = 8;
+const int RELAY_MFC_GATE     = 3;
+const int RELAY_UNUSED_1     = 5;
+const int RELAY_UNUSED_2     = 6;
+#define   TEMP_PIN_1 10
+
+OneWire           oneWire1(TEMP_PIN_1);
+DallasTemperature tempBus1(&oneWire1);
+
+const bool RELAY_ON  = HIGH;
+const bool RELAY_OFF = LOW;
+
+// ── ADC ───────────────────────────────────────────────────────────────────────
+const float VREF    = 3.3f;
+const int   ADC_MAX = 4095;
+
+// ── pH calibration ────────────────────────────────────────────────────────────
+// Original: pH7 @ 1.624V, pH10 @ 1.065V
+// Probe was new on 23 Mar 2026 — attempted recal abandoned due to
+// insufficient hydration. Re-soak 30-60 min then recalibrate.
+
+
+const float PH_M = -7.551f;
+const float PH_B = 15.993f;
+// ── EC calibration ────────────────────────────────────────────────────────────
+const float EC_SLOPE_MSPERMV = 9.006f;
+const float EC_OFFSET_MS     = -5.567f;
+
+// ── ORP calibration ───────────────────────────────────────────────────────────
+const float ORP_OFFSET = -298.0f;
+
+// ── Pump flow rates ───────────────────────────────────────────────────────────
+const float ML_PER_SEC_URINE      = 0.663f;
+const float ML_PER_SEC_ACETATE    = 0.395f;
+const float ML_PER_SEC_PHOSPHORIC = 0.200f;
+
+const float U_MAX_URINE   = ML_PER_SEC_URINE   * 5.0f;
+const float U_MAX_ACETATE = ML_PER_SEC_ACETATE  * 5.0f;
+const float U_MIN         = 0.0f;
+
+// ── Experiment parameters ─────────────────────────────────────────────────────
+const float         PH_LOWER_BOUND   = 6.80f;
+const float         DOSE_ML_PHOS     = 3.0f;
+const unsigned long PHOS_INTERVAL_MS = 60000UL;
+
+const unsigned long LQR_DURATION_MS  = 4UL * 60UL * 60UL * 1000UL;
+const unsigned long BASE_DURATION_MS = 4UL * 60UL * 60UL * 1000UL;
+
+const int MAX_FLOW_LOG = 250;
+float     lqr_flow_log[MAX_FLOW_LOG];
+int       flow_log_count = 0;
+
+// ── Setpoints ─────────────────────────────────────────────────────────────────
+const float VFA0   = 50.05f;
+const float EC0    = 11.1219f;
+const float PH0    =  8.8037f;
+const float U_BASE =  0.050637f;
+
+const float D_OFFSET[3] = { 0.035249f, -0.159900f, 0.012046f };
+
+// ── System matrices ───────────────────────────────────────────────────────────
+const float A_D[3][3] = {
+    { 0.99930577f, -0.00002068f, -0.00003493f },
+    { 0.00233387f,  0.98443635f,  0.02453758f },
+    {-0.00015568f,  0.00111512f,  0.99805077f }
+};
+
+const float B_D[3][2] = {
+    {-4.67659e-07f,  6.86023e-04f },
+    { 3.52408e-03f, -2.42564e-04f },
+    { 2.48775e-02f, -1.49255e-02f }
+};
+
+const float K_LQR[2][3] = {
+    { 22.74667f,  42.30794f,  23.50456f },
+    { 68.17746f,  49.98989f, -19.20145f }
+};
+
+const float L_GAIN[3][2] = {
+    { 0.069052f, -0.012473f },
+    { 0.086008f,  0.010409f },
+    { 0.010409f,  0.092932f }
+};
+
+// ── Observer state ────────────────────────────────────────────────────────────
+float x_obs[3] = { VFA0, EC0, PH0 };
+
+// ── Experiment state machine ──────────────────────────────────────────────────
+enum ExperimentPhase { ACID_DOSE_1, LQR_RUN, ACID_DOSE_2, BASELINE_RUN };
+ExperimentPhase expPhase = ACID_DOSE_1;
+int             expCycle = 0;
+
+unsigned long phaseStartMs  = 0;
+unsigned long lastDoseMs    = 0;
+unsigned long lastDoseMinMs = 0;
+unsigned long lastStatusMs  = 0;
+unsigned long lastCloudMs   = 0;
+int           doseMinsElapsed = 0;
+
+// ── MFC gate ──────────────────────────────────────────────────────────────────
+const unsigned long SAMPLE_STEP_MS  = 1000UL;
+const unsigned long RELAY_SETTLE_MS = 100UL;
+const int ORP_POINTS   = 5;
+const int TOTAL_POINTS = 10;
+unsigned long lastSampleStepMs = 0;
+int           sampleIndex      = 0;
+bool          gateOn           = false;
+
+unsigned long relaySwitchMs = 0;
+bool          relaySettled  = true;
+
+const unsigned long STATUS_INTERVAL_MS = 2000UL;
+const unsigned long CLOUD_INTERVAL_MS  = 5000UL;
+
+// ── Sensor cache ──────────────────────────────────────────────────────────────
+float latest_pH   = PH0, latest_EC  = EC0;
+float latest_ORP  = 0,   latest_MFC = 0;
+float latest_Temp = 20.0f;
+float latest_Q_uri = 0, latest_Q_ace = 0, latest_Q_pho = 0;
+
+float latest_pH_V  = 0.0f;
+float latest_EC_V  = 0.0f;
+float latest_ORP_V = 0.0f;
+float latest_MFC_V = 0.0f;
+
+bool pH_valid = false;
+
+// =============================================================================
+//  UTILITY
+// =============================================================================
+float adcToVolts(int adc) { return (float)adc * (VREF / (float)ADC_MAX); }
+
+int readADC_avg(int pin, int n = 30) {
+    long sum = 0;
+    for (int i = 0; i < n; i++) { sum += analogRead(pin); delay(2); }
+    return (int)(sum / n);
+}
+
+float readPH() {
+    long sum = 0;
+    for (int i = 0; i < 30; i++) { sum += analogRead(PH_PIN_1); delay(2); }
+    latest_pH_V = adcToVolts((int)(sum / 30));
+    float ph = PH_M * latest_pH_V + PH_B;
+    if (latest_pH_V >= 3.28f || latest_pH_V < 0.1f || ph < 0.0f || ph > 14.0f) {
+        pH_valid = false;
+        return latest_pH;
+    }
+    pH_valid = true;
+    return ph;
+}
+
+float readEC() {
+    int raw = readADC_avg(EC_PIN_1);
+    latest_EC_V = adcToVolts(raw);
+    return EC_SLOPE_MSPERMV * latest_EC_V + EC_OFFSET_MS;
+}
+
+float readORP() {
+    long sum = 0;
+    for (int i = 0; i < 30; i++) { sum += analogRead(ORP_PIN_1); delay(2); }
+    latest_ORP_V = adcToVolts((int)(sum / 30));
+    return 1320.0f - latest_ORP_V * 1000.0f - ORP_OFFSET;
+}
+
+float readMFC() {
+    int raw = readADC_avg(MFC_PIN_1);
+    latest_MFC_V = adcToVolts(raw);
+    return latest_MFC_V * 1000.0f;
+}
+
+float readTemp() {
+    tempBus1.requestTemperatures();
+    float c = tempBus1.getTempCByIndex(0);
+    if (c == DEVICE_DISCONNECTED_C || c == 85.0f || c < -55.0f || c > 125.0f) return NAN;
+    return c;
+}
+
+void doseML(int pin, float mL, float mL_per_sec, const char* name) {
+    if (mL <= 0.0f) return;
+    unsigned long ms = (unsigned long)((mL / mL_per_sec) * 1000.0f);
+    if (ms < 30) ms = 30;
+    Serial.print(F("  PUMP ")); Serial.print(name);
+    Serial.print(F(": "));      Serial.print(mL, 3);
+    Serial.print(F(" mL ("));   Serial.print(ms); Serial.println(F(" ms)"));
+    digitalWrite(pin, HIGH); delay(ms); digitalWrite(pin, LOW); delay(100);
+}
+
+// =============================================================================
+//  KALMAN OBSERVER
+// =============================================================================
+void observerUpdate(float u_uri, float u_ace, float meas_EC, float meas_pH) {
+    const float x_nom[3] = { VFA0, EC0, PH0 };
+    float u[2] = { u_uri, u_ace };
+    float x_pred[3];
+    for (int i = 0; i < 3; i++) {
+        float ax = 0.0f, bu = 0.0f;
+        for (int j = 0; j < 3; j++) ax += A_D[i][j] * (x_obs[j] - x_nom[j]);
+        for (int j = 0; j < 2; j++) bu += B_D[i][j] * u[j];
+        x_pred[i] = ax + x_nom[i] + bu + D_OFFSET[i];
+    }
+    float innov[2] = { meas_EC - x_pred[1], meas_pH - x_pred[2] };
+    for (int i = 0; i < 3; i++)
+        x_obs[i] = x_pred[i] + L_GAIN[i][0]*innov[0] + L_GAIN[i][1]*innov[1];
+    x_obs[0] = constrain(x_obs[0],  0.0f, 5000.0f);
+    x_obs[1] = constrain(x_obs[1],  0.0f,   30.0f);
+    x_obs[2] = constrain(x_obs[2],  3.0f,   12.0f);
+}
+
+// =============================================================================
+//  LQR CONTROL LAW
+// =============================================================================
+void lqrDose(float& u_uri, float& u_ace) {
+    if (!pH_valid) {
+        u_uri = 0.0f;
+        u_ace = 0.0f;
+        Serial.println(F("  [LQR] DOSE SKIPPED — pH sensor invalid"));
+        return;
+    }
+    const float x_nom[3] = { VFA0, EC0, PH0 };
+    float dx[3] = { x_obs[0]-x_nom[0], x_obs[1]-x_nom[1], x_obs[2]-x_nom[2] };
+    float raw_uri = U_BASE, raw_ace = U_BASE;
+    for (int j = 0; j < 3; j++) {
+        raw_uri -= K_LQR[0][j] * dx[j];
+        raw_ace -= K_LQR[1][j] * dx[j];
+    }
+    u_uri = constrain(raw_uri, U_MIN, U_MAX_URINE);
+    u_ace = constrain(raw_ace, U_MIN, U_MAX_ACETATE);
+}
+
+// =============================================================================
+//  CLOUD SYNC
+// =============================================================================
+void syncCloud(const char* lbl) {
+    cloud_pH            = latest_pH;
+    cloud_EC_mS         = latest_EC;
+    cloud_ORP_mV        = latest_ORP;
+    cloud_MFC_mV        = latest_MFC;
+    cloud_Temp_C        = latest_Temp;
+    cloud_gateOn        = gateOn;
+    cloud_Q_urine_mL    = latest_Q_uri;
+    cloud_Q_spir_mL     = latest_Q_ace;
+    cloud_Q_kombucha_mL = latest_Q_pho;
+    cloud_stressState   = String(lbl);
+    cloud_stressCycle   = expCycle;
+    cloud_HRT           = 0;
+    cloud_emergency     = false;
+    cloud_holdRemaining_min = 0;
+}
+
+// =============================================================================
+//  SETUP
+// =============================================================================
+void setup() {
+    Serial.begin(115200); delay(1500);
+    analogReadResolution(12);
+
+    pinMode(PUMP_URINE_T1,      OUTPUT); digitalWrite(PUMP_URINE_T1,      LOW);
+    pinMode(PUMP_ACETATE_T1,    OUTPUT); digitalWrite(PUMP_ACETATE_T1,    LOW);
+    pinMode(PUMP_PHOSPHORIC_T1, OUTPUT); digitalWrite(PUMP_PHOSPHORIC_T1, LOW);
+    pinMode(RELAY_MFC_GATE,     OUTPUT); digitalWrite(RELAY_MFC_GATE,     RELAY_OFF);
+    pinMode(RELAY_UNUSED_1,     OUTPUT); digitalWrite(RELAY_UNUSED_1,     LOW);
+    pinMode(RELAY_UNUSED_2,     OUTPUT); digitalWrite(RELAY_UNUSED_2,     LOW);
+
+    tempBus1.begin();
+    tempBus1.setWaitForConversion(true);
+    tempBus1.setResolution(12);
+
+    initProperties();
+    ArduinoCloud.begin(ArduinoIoTPreferredConnection);
+    setDebugMessageLevel(2);
+    ArduinoCloud.printDebugInfo();
+
+    unsigned long now = millis();
+    phaseStartMs = lastDoseMs = lastDoseMinMs =
+    lastStatusMs = lastCloudMs = lastSampleStepMs = now;
+
+    digitalWrite(RELAY_MFC_GATE, RELAY_OFF);
+    delay(200);
+    latest_pH = readPH();
+    latest_EC = readEC();
+    x_obs[0] = VFA0; x_obs[1] = latest_EC; x_obs[2] = latest_pH;
+
+    relaySwitchMs = now;
+    relaySettled  = true;
+    gateOn        = false;
+
+    Serial.println(F("======================================================="));
+    Serial.println(F("  3-STATE LQR vs BASELINE EXPERIMENT"));
+    Serial.println(F("  pH=A11  ORP=A1  EC=A2  MFC=A3"));
+    Serial.println(F("  pH+ORP: gate LOW only  |  MFC: gate HIGH only"));
+    Serial.println(F("  Sequence: ACID -> LQR 4h -> ACID -> BASELINE 4h"));
+    Serial.print  (F("  pH lower bound: ")); Serial.println(PH_LOWER_BOUND, 2);
+    Serial.print  (F("  Setpoints: VFA=")); Serial.print(VFA0, 4);
+    Serial.print  (F("  EC="));             Serial.print(EC0,  4);
+    Serial.print  (F("  pH="));             Serial.println(PH0, 4);
+    Serial.print  (F("  PH_M=")); Serial.print(PH_M, 4);
+    Serial.print  (F("  PH_B=")); Serial.println(PH_B, 4);
+    Serial.print  (F("  EC_SLOPE=")); Serial.print(EC_SLOPE_MSPERMV, 4);
+    Serial.print  (F("  EC_OFFSET=")); Serial.println(EC_OFFSET_MS, 4);
+    Serial.println(F("======================================================="));
+    Serial.println(F("CSVHEADER,Time_s,Phase,Cycle,pH,EC_mS,ORP_mV,Temp_C,Q_uri,Q_ace,Q_pho,VFA_est,EC_obs,pH_obs,pH_raw_V,EC_raw_V,ORP_raw_V,MFC_raw_V,pH_valid"));
+}
+
+// =============================================================================
+//  LOOP
+// =============================================================================
+void loop() {
+    ArduinoCloud.update();
+    digitalWrite(RELAY_UNUSED_1, LOW);
+    digitalWrite(RELAY_UNUSED_2, LOW);
+    unsigned long now = millis();
+
+    // ── MFC gate — switch with settle tracking ────────────────────────────────
+    if (now - lastSampleStepMs >= SAMPLE_STEP_MS) {
+        lastSampleStepMs += SAMPLE_STEP_MS;
+        if (++sampleIndex >= TOTAL_POINTS) sampleIndex = 0;
+
+        bool newGate = (sampleIndex >= ORP_POINTS);
+        if (newGate != gateOn) {
+            gateOn = newGate;
+            digitalWrite(RELAY_MFC_GATE, gateOn ? RELAY_ON : RELAY_OFF);
+            relaySwitchMs = now;
+            relaySettled  = false;
+        }
+    }
+
+    if (!relaySettled && (now - relaySwitchMs >= RELAY_SETTLE_MS))
+        relaySettled = true;
+
+    // ── Sensor read + serial log ──────────────────────────────────────────────
+    if (now - lastStatusMs >= STATUS_INTERVAL_MS) {
+        float EC  = readEC();
+        float Tmp = readTemp();
+        latest_EC = EC;
+        if (!isnan(Tmp)) latest_Temp = Tmp;
+
+        if (!gateOn && relaySettled) {
+            latest_pH  = readPH();
+            latest_ORP = readORP();
+        }
+        if (gateOn && relaySettled) {
+            latest_MFC = readMFC();
+        }
+
+        const char* lbl = (expPhase==ACID_DOSE_1) ? "ACID_1" :
+                          (expPhase==LQR_RUN)      ? "LQR"    :
+                          (expPhase==ACID_DOSE_2)  ? "ACID_2" : "BASELINE";
+
+        Serial.print(F("DATA,"));  Serial.print(now/1000);
+        Serial.print(F(","));      Serial.print(lbl);
+        Serial.print(F(","));      Serial.print(expCycle);
+        Serial.print(F(","));      Serial.print(latest_pH,    3);
+        Serial.print(F(","));      Serial.print(latest_EC,    3);
+        Serial.print(F(","));      Serial.print(latest_ORP,   1);
+        Serial.print(F(","));
+        if (isnan(Tmp)) Serial.print(F("NA")); else Serial.print(Tmp, 2);
+        Serial.print(F(","));      Serial.print(latest_Q_uri, 4);
+        Serial.print(F(","));      Serial.print(latest_Q_ace, 4);
+        Serial.print(F(","));      Serial.print(latest_Q_pho, 4);
+        Serial.print(F(","));      Serial.print(x_obs[0],     4);
+        Serial.print(F(","));      Serial.print(x_obs[1],     4);
+        Serial.print(F(","));      Serial.print(x_obs[2],     4);
+        Serial.print(F(","));      Serial.print(latest_pH_V,  4);
+        Serial.print(F(","));      Serial.print(latest_EC_V,  4);
+        Serial.print(F(","));      Serial.print(latest_ORP_V, 4);
+        Serial.print(F(","));      Serial.print(latest_MFC_V, 4);
+        Serial.print(F(","));      Serial.println(pH_valid ? F("1") : F("0"));
+        lastStatusMs = now;
+    }
+
+    // ── Cloud sync ────────────────────────────────────────────────────────────
+    if (now - lastCloudMs >= CLOUD_INTERVAL_MS) {
+        const char* lbl = (expPhase==ACID_DOSE_1) ? "ACID_1" :
+                          (expPhase==LQR_RUN)      ? "LQR"    :
+                          (expPhase==ACID_DOSE_2)  ? "ACID_2" : "BASELINE";
+        syncCloud(lbl);
+        lastCloudMs = now;
+    }
+
+    // ── PHASE 1 & 3: ACID DOSE ───────────────────────────────────────────────
+    if (expPhase == ACID_DOSE_1 || expPhase == ACID_DOSE_2) {
+        if (latest_pH <= PH_LOWER_BOUND && pH_valid) {
+            latest_Q_pho = 0.0f;
+            if (expPhase == ACID_DOSE_1) {
+                expPhase       = LQR_RUN;
+                flow_log_count = 0;
+                Serial.println(F("=== pH target reached -> STARTING LQR RUN (4h) ==="));
+            } else {
+                expPhase = BASELINE_RUN;
+                Serial.println(F("=== pH target reached -> STARTING BASELINE RUN (4h) ==="));
+            }
+            doseMinsElapsed = 0;
+            phaseStartMs = lastDoseMinMs = lastDoseMs = now;
+            return;
+        }
+        if (now - lastDoseMs >= PHOS_INTERVAL_MS) {
+            digitalWrite(RELAY_MFC_GATE, RELAY_OFF);
+            delay(200);
+            latest_Q_pho = DOSE_ML_PHOS;
+            latest_Q_uri = 0.0f;
+            latest_Q_ace = 0.0f;
+            doseML(PUMP_PHOSPHORIC_T1, DOSE_ML_PHOS, ML_PER_SEC_PHOSPHORIC, "PHOSPHORIC");
+            lastDoseMs = now;
+            observerUpdate(0.0f, 0.0f, latest_EC, latest_pH);
+            Serial.print(F("  [ACID] pH=")); Serial.print(latest_pH, 3);
+            Serial.print(F("  valid="));     Serial.print(pH_valid ? F("Y") : F("N"));
+            Serial.print(F("  target="));    Serial.println(PH_LOWER_BOUND, 2);
+        }
+        return;
+    }
+
+    // ── PHASE 2: LQR RUN ─────────────────────────────────────────────────────
+    if (expPhase == LQR_RUN) {
+        if (now - phaseStartMs >= LQR_DURATION_MS) {
+            expPhase     = ACID_DOSE_2;
+            phaseStartMs = lastDoseMs = now;
+            latest_Q_uri = latest_Q_ace = 0.0f;
+            Serial.println(F("=== LQR 4h complete -> ACID_DOSE_2 ==="));
+            return;
+        }
+        if (now - lastDoseMinMs >= 60000UL) {
+            lastDoseMinMs = now;
+            digitalWrite(RELAY_MFC_GATE, RELAY_OFF);
+            delay(200);
+            float u_uri, u_ace;
+            lqrDose(u_uri, u_ace);
+            if (u_uri > 0.0f || u_ace > 0.0f) {
+                if (flow_log_count < MAX_FLOW_LOG)
+                    lqr_flow_log[flow_log_count++] = u_uri + u_ace;
+                latest_Q_uri = u_uri;
+                latest_Q_ace = u_ace;
+                latest_Q_pho = 0.0f;
+                doseML(PUMP_URINE_T1,   u_uri, ML_PER_SEC_URINE,   "URINE");
+                doseML(PUMP_ACETATE_T1, u_ace, ML_PER_SEC_ACETATE, "ACETATE");
+            }
+            doseMinsElapsed++;
+            observerUpdate(u_uri, u_ace, latest_EC, latest_pH);
+            Serial.print(F("  [LQR] min="));  Serial.print(doseMinsElapsed);
+            Serial.print(F("  pH="));          Serial.print(latest_pH,  3);
+            Serial.print(F("  valid="));       Serial.print(pH_valid ? F("Y") : F("N"));
+            Serial.print(F("  EC="));          Serial.print(latest_EC,  3);
+            Serial.print(F("  VFA_est="));     Serial.print(x_obs[0],   2);
+            Serial.print(F("  u_uri="));       Serial.print(u_uri,      4);
+            Serial.print(F("  u_ace="));       Serial.println(u_ace,    4);
+            syncCloud("LQR");
+        }
+        return;
+    }
+
+    // ── PHASE 4: BASELINE RUN ────────────────────────────────────────────────
+    if (expPhase == BASELINE_RUN) {
+        if (now - phaseStartMs >= BASE_DURATION_MS) {
+            expCycle++;
+            expPhase        = ACID_DOSE_1;
+            phaseStartMs    = lastDoseMs = now;
+            doseMinsElapsed = flow_log_count = 0;
+            latest_Q_uri    = latest_Q_ace = 0.0f;
+            Serial.print(F("=== BASELINE 4h complete. Starting cycle "));
+            Serial.print(expCycle);
+            Serial.println(F(" ==="));
+            return;
+        }
+        if (now - lastDoseMinMs >= 60000UL) {
+            lastDoseMinMs = now;
+            digitalWrite(RELAY_MFC_GATE, RELAY_OFF);
+            delay(200);
+            float total = 0.0f;
+            if      (doseMinsElapsed < flow_log_count) total = lqr_flow_log[doseMinsElapsed];
+            else if (flow_log_count > 0)               total = lqr_flow_log[flow_log_count - 1];
+            float u_uri = constrain(total / 2.0f, U_MIN, U_MAX_URINE);
+            float u_ace = constrain(total / 2.0f, U_MIN, U_MAX_ACETATE);
+            latest_Q_uri = u_uri;
+            latest_Q_ace = u_ace;
+            latest_Q_pho = 0.0f;
+            doseML(PUMP_URINE_T1,   u_uri, ML_PER_SEC_URINE,   "URINE");
+            doseML(PUMP_ACETATE_T1, u_ace, ML_PER_SEC_ACETATE, "ACETATE");
+            doseMinsElapsed++;
+            observerUpdate(u_uri, u_ace, latest_EC, latest_pH);
+            Serial.print(F("  [BASE] min="));  Serial.print(doseMinsElapsed);
+            Serial.print(F("  pH="));           Serial.print(latest_pH, 3);
+            Serial.print(F("  EC="));           Serial.print(latest_EC,  3);
+            Serial.print(F("  total_mL="));     Serial.println(total,    4);
+            syncCloud("BASELINE");
+        }
+        return;
+    }
+}
