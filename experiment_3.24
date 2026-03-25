@@ -76,9 +76,9 @@ const float EC_OFFSET_MS     = -5.567f;
 const float ORP_OFFSET = -298.0f;
 
 // ── Pump flow rates ───────────────────────────────────────────────────────────
-const float ML_PER_SEC_URINE      = 0.663f;
-const float ML_PER_SEC_ACETATE    = 0.395f;
-const float ML_PER_SEC_PHOSPHORIC = 0.200f;
+const float ML_PER_SEC_URINE      = 1.855f;
+const float ML_PER_SEC_ACETATE    = 1.055f;
+const float ML_PER_SEC_PHOSPHORIC = 0.725f;
 
 const float U_MAX_URINE   = ML_PER_SEC_URINE   * 5.0f;
 const float U_MAX_ACETATE = ML_PER_SEC_ACETATE  * 5.0f;
