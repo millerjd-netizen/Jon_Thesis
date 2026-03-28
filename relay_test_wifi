@@ -19,7 +19,7 @@ const int PIN_MFC_GATE  = 3;
 const int PIN_ACETATE   = 4;
 const int PIN_URINE     = 8;
 
-const int pins[]   = { PIN_KOMBUCHA, PIN_MFC_GATE, PIN_ACETATE, PIN_URINE };
+const int pins[] = { PIN_KOMBUCHA, PIN_MFC_GATE, PIN_ACETATE, PIN_URINE };
 const char* names[] = { "KOMBUCHA (D2)", "MFC_GATE (D3)", "ACETATE (D4)", "URINE (D8)" };
 
 const int PIN_COUNT = 4;
@@ -43,7 +43,6 @@ void allOff() {
 // SETUP
 // -------------------------------
 void setup() {
-
   Serial.begin(115200);
   delay(1500);
 
@@ -55,9 +54,7 @@ void setup() {
     digitalWrite(pins[i], LOW);
   }
 
-  // -------------------------------
   // Arduino Cloud connection
-  // -------------------------------
   initProperties();
   ArduinoCloud.begin(ArduinoIoTPreferredConnection);
 
@@ -69,12 +66,10 @@ void setup() {
 // MAIN LOOP
 // -------------------------------
 void loop() {
-
   // Keep device connected to Arduino Cloud
   ArduinoCloud.update();
 
   for (int i = 0; i < PIN_COUNT; i++) {
-
     allOff();
     delay(100);
 
@@ -87,4 +82,11 @@ void loop() {
     digitalWrite(pins[i], LOW);
     delay(OFF_TIME);
   }
+}
+
+// -------------------------------
+// REQUIRED ARDUINO CLOUD CALLBACK
+// -------------------------------
+void onCloudVFAMLChange() {
+  // Do nothing for now
 }
