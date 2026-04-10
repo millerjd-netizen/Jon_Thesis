@@ -6,7 +6,7 @@
  *
  * STATES:  x = [VFA (mg/L), EC (mS/cm), pH]
  * INPUTS:  u = [u_urine, u_applejuice]
- * OUTPUTS: y = [EC, pH]  (VFA unmeasured — Kalman estimated)
+ * OUTPUTS: y = [EC, pH]  (VFA unmeasured)
  *
  * EXPERIMENT SEQUENCE (repeating forever):
  *   PHASE 1 — ACID DOSE:    10 mL phosphoric (one-time), then 1.5 mL every 60s until pH <= 6.5
@@ -151,7 +151,7 @@ const float K_LQR[2][3] = {
     {  7.94797f, -3.98169f, -176.98608f}    // u_apple_juice
 };
 
-// ── Kalman observer gain ──────────────────────────────────────────────────────
+// ── Luenberg observer gain ──────────────────────────────────────────────────────
 const float L_GAIN[3][2] = {
     { 0.069052f, -0.012473f },
     { 0.086008f,  0.010409f },
